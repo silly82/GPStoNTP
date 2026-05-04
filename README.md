@@ -22,7 +22,7 @@ ESP32-basierter NTP-Zeitserver (Stratum 1), der GPS-Zeit über ein W5500-Etherne
 | ETH RST | 9 |
 | GPS RX (ESP empfängt) | 1 |
 | GPS TX (ESP sendet) | 2 |
-| PPS | 3 |
+| PPS | 4 |
 
 ## Netzwerkkonfiguration
 
