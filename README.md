@@ -154,24 +154,30 @@ Nach jedem Lauf wird `tools/gpsconfig.md` mit den tatsächlich angewendeten Eins
 1. Arduino IDE ≥ 2.x öffnen, ESP32-Boardpaket installiert (Espressif).
 2. Board: **ESP32S3 Dev Module** (oder passendes ESP32-Board).
 3. Obige Bibliotheken installieren.
-4. `GPStoNTP.ino` öffnen, Netzwerk- und MQTT-Parameter in den `#define`/`const`-Blöcken anpassen.
-5. Kompilieren & Hochladen.
+4. `tools/ublox_config.py` ausführen um das GPS-Modul zu konfigurieren.
+5. `config.h.example` → `config.h` kopieren und Werte eintragen.
+6. Kompilieren & Hochladen.
 
 ## Konfiguration anpassen
 
-Alle konfigurierbaren Werte stehen am Anfang der Datei `GPStoNTP.ino`:
+Alle konfigurierbaren Werte stehen in `config.h` (aus `config.h.example` kopieren):
 
 ```cpp
-// Netzwerk
-byte mac[]       = { 0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED };
-IPAddress ip     (192, 168, x, x);
-...
+/* --- NETZWERK --- */
+#define CFG_MAC      { 0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED }
+#define CFG_IP       192, 168, x,   x
+#define CFG_GATEWAY  192, 168, x,   1
+#define CFG_SUBNET   255, 255, 255, 0
+#define CFG_DNS      192, 168, x,   1
 
-// MQTT
-const char* mqtt_server = "192.168.x.x";
-const char* mqtt_user   = "your_user";
-const char* mqtt_pass   = "your_password";
+/* --- MQTT --- */
+#define CFG_MQTT_SERVER  "192.168.x.x"
+#define CFG_MQTT_USER    "your_user"
+#define CFG_MQTT_PASS    "your_password"
+#define CFG_MQTT_TOPIC   "ntp/status"
 ```
+
+`config.h` ist in `.gitignore` eingetragen und wird nie commitet.
 
 ## Lizenz
 

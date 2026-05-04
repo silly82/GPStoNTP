@@ -4,7 +4,7 @@
  * Hardware:
  *   - ESP32 (z.B. S3 DevKit)
  *   - W5500 Ethernet-Modul (SPI)
- *   - GPS-Modul mit NMEA-Ausgang (UART, 9600 Baud)
+ *   - GPS-Modul mit NMEA-Ausgang (UART, 115200 Baud)
  *   - PPS-Ausgang des GPS-Moduls für präzisen 1-Hz-Takt
  *
  * Abhängigkeiten (Arduino Library Manager):
@@ -61,7 +61,7 @@ uint32_t ntpEpochAtLastPPS = 0; // NTP-Epoch der Sekunde, die der letzte PPS mar
 uint32_t ntpRequestsServed = 0;
 
 /* ------------------------------------------------------------------ */
-/*  Interrupt: PPS-Flanke per Hardware-Timer laten                      */
+/*  Interrupt: PPS-Flanke per Hardware-Timer latchen                    */
 /* ------------------------------------------------------------------ */
 void IRAM_ATTR ppsHandler() {
   lastPPSus = esp_timer_get_time(); // Hardware-Timer, direkt beim Edge gelesen
@@ -95,7 +95,7 @@ void setup() {
   pinMode(PPS_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(PPS_PIN), ppsHandler, RISING);
 
-  Serial.println("Stratum-1 Server bereit. IP: 192.168.188.2");
+  Serial.println("Stratum-1 Server bereit.");
 }
 
 /* ------------------------------------------------------------------ */
