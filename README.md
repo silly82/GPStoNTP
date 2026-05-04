@@ -28,8 +28,8 @@ ESP32-basierter NTP-Zeitserver (Stratum 1), der GPS-Zeit über ein W5500-Etherne
 
 | Parameter | Wert |
 |---|---|
-| IP-Adresse | 192.168.188.2 |
-| Gateway | 192.168.188.1 |
+| IP-Adresse | 192.168.x.x |
+| Gateway | 192.168.x.x |
 | Subnetzmaske | 255.255.255.0 |
 | NTP-Port | 123/UDP |
 
@@ -98,13 +98,13 @@ Alle konfigurierbaren Werte stehen am Anfang der Datei `GPStoNTP.ino`:
 ```cpp
 // Netzwerk
 byte mac[]       = { 0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED };
-IPAddress ip     (192, 168, 188, 2);
+IPAddress ip     (192, 168, x, x);
 ...
 
 // MQTT
-const char* mqtt_server = "192.168.188.62";
-const char* mqtt_user   = "silly82";
-const char* mqtt_pass   = "...";
+const char* mqtt_server = "192.168.x.x";
+const char* mqtt_user   = "your_user";
+const char* mqtt_pass   = "your_password";
 ```
 
 ## Lizenz
