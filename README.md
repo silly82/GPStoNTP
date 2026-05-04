@@ -67,20 +67,34 @@ Alle über den Arduino Library Manager installierbar:
 
 ```
 GPS-Modul
-  │  NMEA (9600 Baud) ──► TinyGPS++ ──► UTC-Zeit → NTP-Epoch
+  │  NMEA (9600 Baud) ──► TinyGPS++ ──► ntpEpochAtLastPPS
+  │                        (kommt 100–400 ms nach PPS,
+  │                         trägt die Zeit des letzten PPS)
   │
-  └─ PPS (1 Hz, RISING) ──► ISR speichert micros()
+  └─ PPS (1 Hz, RISING) ──► ISR: lastPPSus = esp_timer_get_time()
                                 │
                          NTP-Anfrage eingehend
                                 │
-                         Transmit-Timestamp =
-                           GPS-Epoch + (micros() – lastPPS) / 1e6
+                    ┌───────────┴────────────┐
+                 T2 (Receive)           T3 (Transmit)
+          esp_timer beim Empfang    esp_timer vor dem Senden
+                    │
+          Seconds  = ntpEpochAtLastPPS + Δt / 1e6
+          Fraction = (Δt % 1e6) × 2³² / 1e6
 ```
 
-1. **GPS-Parsing**: TinyGPS++ liest NMEA-Sätze aus `HardwareSerial(1)` und liefert validierte UTC-Zeit und Datum.
-2. **NTP-Epoch**: GPS-UTC wird in einen NTP-Timestamp (Sekunden seit 1.1.1900) umgerechnet.
-3. **PPS-ISR**: Beim jedem sekundengenauem PPS-Puls wird `micros()` gespeichert. Damit lässt sich der Sub-Sekunden-Anteil für den NTP-Transmit-Timestamp berechnen.
-4. **NTP-Antwort**: Eingehende UDP-Pakete auf Port 123 werden nach RFC 4330 beantwortet (Stratum 1, Referenz "GPS ").
+1. **GPS-Parsing**: TinyGPS++ liest NMEA-Sätze aus `HardwareSerial(1)`. Die Sentence trifft 100–400 ms nach dem PPS-Puls ein und enthält die Zeit der gerade gestarteten Sekunde — also genau die Sekunde, die `lastPPSus` markiert.
+2. **PPS/NMEA-Sync**: `ntpEpochAtLastPPS` wird beim NMEA-Parse gesetzt und ist damit korrekt an den Hardware-Timer-Wert `lastPPSus` gebunden.
+3. **PPS-ISR**: Bei jeder steigenden PPS-Flanke wird `esp_timer_get_time()` (64-bit Hardware-Timer, kein Arduino-HAL-Overhead) direkt im Interrupt gespeichert.
+4. **NTP-Antwort** (RFC 4330, Stratum 1, Referenz `GPS `):
+
+   | Feld | Bytes | Inhalt |
+   |---|---|---|
+   | Reference Timestamp | 16–23 | Zeitpunkt des letzten GPS/PPS-Sync |
+   | Origin Timestamp | 24–31 | T1 des Clients (unverändert zurück) |
+   | Receive Timestamp | 32–39 | T2: Hardware-Timer beim Paketempfang |
+   | Transmit Timestamp | 40–47 | T3: Hardware-Timer kurz vor dem Senden |
+
 5. **MQTT**: Alle 30 s wird ein Statuspaket an den konfigurierten Broker gesendet.
 
 ## Kompilieren & Flashen
