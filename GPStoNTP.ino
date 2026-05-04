@@ -88,8 +88,8 @@ void setup() {
   // MQTT
   mqttClient.setServer(mqtt_server, 1883);
 
-  // GPS-UART (9600 Baud, sicher für alle gängigen Module)
-  GPS_Serial.begin(9600, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+  // GPS-UART (115200 Baud, konfiguriert via ublox_config.py)
+  GPS_Serial.begin(115200, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
 
   // PPS-Interrupt auf steigende Flanke
   pinMode(PPS_PIN, INPUT_PULLUP);
