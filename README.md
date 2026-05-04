@@ -1,6 +1,16 @@
 # GPStoNTP — Stratum-1 NTP Server
 
-ESP32-basierter NTP-Zeitserver (Stratum 1), der GPS-Zeit über ein W5500-Ethernet-Modul im lokalen Netzwerk bereitstellt. Ein PPS-Signal (Pulse Per Second) sorgt für Sub-Millisekunden-Genauigkeit. Der Status wird per MQTT publiziert.
+ESP32-basierter NTP-Zeitserver (Stratum 1), der GPS-Zeit über ein W5500-Ethernet-Modul im lokalen Netzwerk bereitstellt. Ein PPS-Signal (Pulse Per Second) sorgt für präzise Zeitstempelung. Der Status wird per MQTT publiziert.
+
+## Genauigkeit
+
+| Ebene | Typischer Wert |
+|---|---|
+| GPS-Timing (NEO-M8N, PPS) | 50–200 ns |
+| ESP32 Interrupt-Jitter (`esp_timer`) | ~1–5 µs |
+| NTP über Ethernet (LAN) | 100–500 µs |
+
+Der Flaschenhals ist das Netzwerk — die GPS/PPS-Genauigkeit des NEO-M8N ist für einen Stratum-1 Server im LAN mehr als ausreichend. Survey-in Timing Mode (NEO-M8T) würde die GPS-Ebene auf ~10–50 ns verbessern, ändert aber nichts an der NTP-Netzwerkgenauigkeit.
 
 ## Hardware
 
@@ -8,7 +18,7 @@ ESP32-basierter NTP-Zeitserver (Stratum 1), der GPS-Zeit über ein W5500-Etherne
 |---|---|
 | Mikrocontroller | ESP32-S3 DevKit |
 | Ethernet | W5500 SPI-Modul |
-| GPS | u-blox NEO-6M / NEO-8M (NMEA, 9600 Baud) |
+| GPS | u-blox NEO-M8N (NMEA, 115200 Baud nach Konfiguration) |
 | PPS | GPS-Modul PPS-Ausgang |
 
 ### Pinbelegung
