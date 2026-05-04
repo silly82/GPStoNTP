@@ -77,7 +77,7 @@ Alle über den Arduino Library Manager installierbar:
 
 ```
 GPS-Modul
-  │  NMEA (9600 Baud) ──► TinyGPS++ ──► ntpEpochAtLastPPS
+  │  NMEA (115200 Baud) ──► TinyGPS++ ──► ntpEpochAtLastPPS
   │                        (kommt 100–400 ms nach PPS,
   │                         trägt die Zeit des letzten PPS)
   │
@@ -106,6 +106,48 @@ GPS-Modul
    | Transmit Timestamp | 40–47 | T3: Hardware-Timer kurz vor dem Senden |
 
 5. **MQTT**: Alle 30 s wird ein Statuspaket an den konfigurierten Broker gesendet.
+
+## Tools
+
+### `tools/ublox_config.py` — GPS-Modul konfigurieren
+
+Python-Script zur einmaligen Erstkonfiguration des u-blox GPS-Moduls über USB-Serial.
+
+**Voraussetzung:**
+```bash
+pip install pyserial
+```
+
+**Verwendung:**
+```bash
+# Auto-Erkennung (Port + Baudrate werden automatisch gefunden)
+python tools/ublox_config.py
+
+# Expliziter Port
+python tools/ublox_config.py --port /dev/ttyUSB0
+python tools/ublox_config.py --port COM3
+
+# Aktuelle Baudrate angeben (falls Auto-Erkennung fehlschlägt)
+python tools/ublox_config.py --port /dev/ttyUSB0 --baud 9600
+
+# Trocken-Lauf: konfigurieren ohne dauerhaft zu speichern
+python tools/ublox_config.py --no-save
+```
+
+**Was das Script macht:**
+
+| Schritt | UBX-Befehl | Beschreibung |
+|---|---|---|
+| Chip-Erkennung | `MON-VER` | Modell und Firmware-Version auslesen |
+| Stationärer Modus | `CFG-NAV5` | dynModel=1, optimiert für festen Standort |
+| GNSS maximieren | `CFG-GNSS` | Alle Systeme aktivieren, Kanal-Limit aufheben (M8+) |
+| PPS-Timepuls | `CFG-TP5` | 1 Hz, UTC-ausgerichtet, nur aktiv wenn gelockt |
+| Baudrate | `CFG-PRT` | UART1 auf 115200 Baud |
+| Speichern | `CFG-CFG` | Dauerhaft in BBR + Flash |
+
+Nach jedem Lauf wird `tools/gpsconfig.md` mit den tatsächlich angewendeten Einstellungen neu generiert (nicht im Repository, da automatisch erstellt).
+
+> **Reihenfolge:** Script ausführen, dann erst den Arduino-Sketch flashen — der Sketch erwartet 115200 Baud vom GPS-Modul.
 
 ## Kompilieren & Flashen
 
