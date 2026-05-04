@@ -19,6 +19,7 @@
 #include <TinyGPS++.h>
 #include <PubSubClient.h>
 #include <time.h>
+#include "config.h"
 
 /* --- HARDWARE MAPPING --- */
 #define ETH_SCLK_PIN 13
@@ -30,18 +31,18 @@
 #define GPS_TX_PIN   2
 #define PPS_PIN      3
 
-/* --- NETZWERK-KONFIGURATION --- */
-byte mac[]       = { 0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED };
-IPAddress ip     (192, 168, 188,   2);
-IPAddress gateway(192, 168, 188,   1);
-IPAddress subnet (255, 255, 255,   0);
-IPAddress dns    (192, 168, 188,   1);
+/* --- NETZWERK-KONFIGURATION (aus config.h) --- */
+byte mac[]       = CFG_MAC;
+IPAddress ip     (CFG_IP);
+IPAddress gateway(CFG_GATEWAY);
+IPAddress subnet (CFG_SUBNET);
+IPAddress dns    (CFG_DNS);
 
-/* --- MQTT-KONFIGURATION --- */
-const char* mqtt_server = "192.168.188.62";
-const char* mqtt_user   = "silly82";
-const char* mqtt_pass   = "Silly3612992899";
-const char* mqtt_topic  = "ntp/status";
+/* --- MQTT-KONFIGURATION (aus config.h) --- */
+const char* mqtt_server = CFG_MQTT_SERVER;
+const char* mqtt_user   = CFG_MQTT_USER;
+const char* mqtt_pass   = CFG_MQTT_PASS;
+const char* mqtt_topic  = CFG_MQTT_TOPIC;
 
 /* --- GLOBALE OBJEKTE --- */
 EthernetUDP    ntpUDP;
