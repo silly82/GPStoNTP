@@ -2,7 +2,10 @@
 """
 ublox_config.py — u-blox GPS Konfiguration für stationären NTP-Betrieb
 
-Erkennt den angeschlossenen u-blox Chip automatisch und konfiguriert:
+Erkennt den angeschlossenen u-blox Chip automatisch, konfiguriert ihn und
+schreibt danach gpsconfig.md mit den tatsächlich angewendeten Einstellungen.
+
+Konfiguriert:
   - Stationärer Modus (dynModel=1)
   - Alle verfügbaren GNSS-Systeme aktivieren (M8+ only)
   - Maximale Satelliten-Kanalzahl (Limit aufheben)
@@ -21,9 +24,11 @@ Verwendung:
 """
 
 import argparse
+import os
 import struct
 import sys
 import time
+from datetime import datetime
 
 import serial
 import serial.tools.list_ports
@@ -32,11 +37,14 @@ import serial.tools.list_ports
 # Konstanten
 # ---------------------------------------------------------------------------
 
-TARGET_BAUD  = 115200
-PROBE_BAUDS  = [9600, 115200, 38400, 57600, 4800]
+TARGET_BAUD = 115200
+PROBE_BAUDS = [9600, 115200, 38400, 57600, 4800]
 
 GNSS_NAMES = {0: "GPS", 1: "SBAS", 2: "Galileo", 3: "BeiDou",
-              4: "IMES", 5: "QZSS", 6: "GLONASS"}
+              4: "IMES", 5: "QZSS",  6: "GLONASS"}
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+MD_PATH    = os.path.join(SCRIPT_DIR, "gpsconfig.md")
 
 # ---------------------------------------------------------------------------
 # UBX Protokoll-Hilfsfunktionen
@@ -61,35 +69,28 @@ def _send(ser: serial.Serial, cls: int, id_: int, payload: bytes = b"") -> None:
 
 
 def _read_ubx(ser: serial.Serial, timeout: float = 2.0):
-    """Liest eine UBX-Nachricht; überspringt NMEA-Zeilen. Gibt (cls, id, payload) zurück."""
+    """Liest eine UBX-Nachricht; überspringt NMEA-Zeilen."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        remaining = deadline - time.monotonic()
-        ser.timeout = min(remaining, 0.05)
-
+        ser.timeout = min(deadline - time.monotonic(), 0.05)
         b = ser.read(1)
         if not b or b[0] != 0xB5:
             continue
         b = ser.read(1)
         if not b or b[0] != 0x62:
             continue
-
         hdr = ser.read(4)
         if len(hdr) < 4:
             continue
         cls, id_ = hdr[0], hdr[1]
         length = struct.unpack("<H", hdr[2:4])[0]
-
         body = ser.read(length + 2)
         if len(body) < length + 2:
             continue
-
-        payload   = body[:length]
-        checksum  = body[length:]
-        expected  = _checksum(bytes([cls, id_]) + hdr[2:4] + payload)
-        if bytes(checksum) != expected:
+        payload  = body[:length]
+        checksum = body[length:]
+        if bytes(checksum) != _checksum(bytes([cls, id_]) + hdr[2:4] + payload):
             continue
-
         return cls, id_, bytes(payload)
     return None
 
@@ -103,7 +104,7 @@ def _wait_ack(ser: serial.Serial, cls: int, id_: int, timeout: float = 2.0) -> b
         r_cls, r_id, r_payload = msg
         if r_cls == 0x05 and len(r_payload) >= 2:
             if r_payload[0] == cls and r_payload[1] == id_:
-                return r_id == 0x01  # 0x01=ACK, 0x00=NAK
+                return r_id == 0x01
     return False
 
 
@@ -117,7 +118,6 @@ def _send_ack(ser: serial.Serial, cls: int, id_: int,
 
 def _poll(ser: serial.Serial, cls: int, id_: int,
           poll_payload: bytes = b"", timeout: float = 2.0):
-    """Sendet einen Poll-Request und wartet auf die Antwort gleicher Klasse/ID."""
     _send(ser, cls, id_, poll_payload)
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -131,7 +131,6 @@ def _poll(ser: serial.Serial, cls: int, id_: int,
 # ---------------------------------------------------------------------------
 
 def find_ublox() -> tuple:
-    """Scannt alle Ports; gibt (port, baud) des ersten u-blox Moduls zurück."""
     ports = [p.device for p in serial.tools.list_ports.comports()]
     if not ports:
         return None, None
@@ -141,7 +140,7 @@ def find_ublox() -> tuple:
             try:
                 with serial.Serial(port, baud, timeout=0.5) as ser:
                     ser.reset_input_buffer()
-                    _send(ser, 0x0A, 0x04)           # MON-VER Poll
+                    _send(ser, 0x0A, 0x04)
                     msg = _read_ubx(ser, timeout=1.2)
                     if msg and msg[0] == 0x0A and msg[1] == 0x04:
                         print(f"u-blox gefunden auf {port} @ {baud} Baud")
@@ -173,102 +172,229 @@ def detect_generation(ver: dict) -> int:
     return 6
 
 # ---------------------------------------------------------------------------
-# Konfigurationsschritte
+# Konfigurationsschritte — geben jeweils ein dict mit den Ist-Werten zurück
 # ---------------------------------------------------------------------------
 
-def cfg_nav5_stationary(ser: serial.Serial) -> bool:
-    """Stationärer Modus (dynModel=1, Auto-Fix 2D/3D)."""
+def cfg_nav5_stationary(ser: serial.Serial) -> dict:
+    """Stationärer Modus. Gibt {"dynModel", "fixMode", "ok"} zurück."""
     payload = _poll(ser, 0x06, 0x24)
     p = bytearray(payload) if payload and len(payload) >= 36 else bytearray(36)
-    struct.pack_into("<H", p, 0, 0x0005)  # mask: dynModel + fixMode
-    p[2] = 1   # dynModel = 1 (Stationary)
-    p[3] = 3   # fixMode  = 3 (Auto 2D/3D)
-    return _send_ack(ser, 0x06, 0x24, bytes(p),
-                     "Stationärer Modus (dynModel=1, fixMode=3)")
+    struct.pack_into("<H", p, 0, 0x0005)
+    p[2] = 1
+    p[3] = 3
+    ok = _send_ack(ser, 0x06, 0x24, bytes(p),
+                   "Stationärer Modus (dynModel=1, fixMode=3)")
+    return {"dynModel": 1, "fixMode": 3, "ok": ok}
 
 
-def cfg_gnss_all(ser: serial.Serial) -> bool:
-    """Alle GNSS-Systeme aktivieren, Kanal-Limit aufheben (M8+ only)."""
+def cfg_gnss_all(ser: serial.Serial) -> dict:
+    """Alle GNSS-Systeme aktivieren. Gibt {"systems": [...], "ok"} zurück."""
     payload = _poll(ser, 0x06, 0x3E)
     if not payload or len(payload) < 4:
         print("  SKIP GNSS-Konfiguration nicht verfügbar (NEO-6/7)")
-        return False
+        return {"systems": [], "ok": False, "skipped": True}
 
     p = bytearray(payload)
     num_blocks = p[3]
-    p[1] = 0xFF  # numTrkChUse = alle verfügbaren Hardware-Kanäle
+    p[1] = 0xFF
 
+    systems = []
     for i in range(num_blocks):
         off = 4 + i * 8
         if off + 8 > len(p):
             break
-        gnss_id  = p[off]
-        max_trk  = p[off + 2]
-        flags    = struct.unpack_from("<I", p, off + 4)[0]
-        flags   |= 0x01              # enable
+        gnss_id = p[off]
+        max_trk = p[off + 2]
+        flags   = struct.unpack_from("<I", p, off + 4)[0]
+        flags  |= 0x01
         struct.pack_into("<I", p, off + 4, flags)
         name = GNSS_NAMES.get(gnss_id, f"GNSS-{gnss_id}")
         print(f"       {name}: aktiviert, max {max_trk} Kanäle")
+        systems.append({"name": name, "max_trk": max_trk, "gnss_id": gnss_id})
 
-    return _send_ack(ser, 0x06, 0x3E, bytes(p),
-                     "GNSS Multi-System + Kanal-Limit aufgehoben")
+    ok = _send_ack(ser, 0x06, 0x3E, bytes(p),
+                   "GNSS Multi-System + Kanal-Limit aufgehoben")
+    return {"systems": systems, "ok": ok, "skipped": False}
 
 
-def cfg_timepulse(ser: serial.Serial) -> bool:
-    """PPS: 1 Hz, UTC-ausgerichtet, 100 ms Puls, nur aktiv wenn gelockt."""
+def cfg_timepulse(ser: serial.Serial) -> dict:
+    """PPS konfigurieren. Gibt die tatsächlichen Werte als dict zurück."""
+    freq_hz    = 1
+    pulse_us   = 100_000
+    cable_ns   = 0
+    user_ns    = 0
     flags = (
         (1 << 0) |  # active
         (1 << 1) |  # lockGnssFreq
-        (1 << 2) |  # lockedOtherSet (Lock-Werte wenn gesynct)
-        (1 << 3) |  # isFreq (freqPeriod in Hz)
-        (1 << 4) |  # isLength (pulseLenRatio in µs)
+        (1 << 2) |  # lockedOtherSet
+        (1 << 3) |  # isFreq
+        (1 << 4) |  # isLength
         (1 << 5) |  # alignToTow
         (1 << 6)    # polarity: steigende Flanke = Sekundenanfang
-        # Bits 7-10 gridUtcGnss = 0 → UTC
     )
     payload = (
-        struct.pack("<BB",  0, 0)        +  # tpIdx=0, version=0
-        b"\x00\x00"                      +  # reserved
-        struct.pack("<hh",  0, 0)        +  # antCableDelay, rfGroupDelay (ns)
-        struct.pack("<II",  1, 1)        +  # freqPeriod, freqPeriodLock (Hz)
-        struct.pack("<II",  100000, 100000) +  # pulseLenRatio, pulseLenRatioLock (µs)
-        struct.pack("<i",   0)           +  # userConfigDelay (ns)
-        struct.pack("<I",   flags)          # flags
+        struct.pack("<BB",  0, 0)              +
+        b"\x00\x00"                            +
+        struct.pack("<hh",  cable_ns, 0)       +
+        struct.pack("<II",  freq_hz, freq_hz)  +
+        struct.pack("<II",  pulse_us, pulse_us)+
+        struct.pack("<i",   user_ns)           +
+        struct.pack("<I",   flags)
     )
     assert len(payload) == 32
-    return _send_ack(ser, 0x06, 0x31, payload,
-                     "PPS: 1 Hz, UTC-ausgerichtet, 100 ms Puls")
+    ok = _send_ack(ser, 0x06, 0x31, payload,
+                   f"PPS: {freq_hz} Hz, UTC-ausgerichtet, {pulse_us//1000} ms Puls")
+    return {"freq_hz": freq_hz, "pulse_us": pulse_us,
+            "cable_ns": cable_ns, "user_ns": user_ns,
+            "flags": flags, "ok": ok}
 
 
-def cfg_baud(ser: serial.Serial, new_baud: int) -> None:
-    """Ändert die UART1-Baudrate. ACK kommt bei altem Baud, danach sofort neuer."""
+def cfg_baud(ser: serial.Serial, new_baud: int) -> bool:
     payload = _poll(ser, 0x06, 0x00, poll_payload=b"\x01", timeout=1.0)
     if not payload or len(payload) < 20:
-        # Fallback: Standard 8N1, UBX+NMEA in/out
         payload = struct.pack("<BBHIIHHHxx",
-            0x01, 0x00, 0x0000,
-            0x000008D0,   # 8N1
-            9600,
-            0x0003,       # inProtoMask: UBX + NMEA
-            0x0003,       # outProtoMask: UBX + NMEA
-            0x0000)
+            0x01, 0x00, 0x0000, 0x000008D0, 9600,
+            0x0003, 0x0003, 0x0000)
     p = bytearray(payload)
     struct.pack_into("<I", p, 8, new_baud)
     _send(ser, 0x06, 0x00, bytes(p))
-    # ACK kommt noch bei alter Baudrate
     _wait_ack(ser, 0x06, 0x00, timeout=0.3)
     print(f"  OK   Baudrate → {new_baud} Baud")
+    return True
 
 
 def cfg_save(ser: serial.Serial) -> bool:
-    """Speichert alle Einstellungen in BBR und Flash."""
     payload = struct.pack("<IIIB",
-        0x00000000,   # clearMask
-        0x0000FFFF,   # saveMask (alles)
-        0x00000000,   # loadMask
-        0x17)         # deviceMask: BBR + Flash + EEPROM
+        0x00000000, 0x0000FFFF, 0x00000000, 0x17)
     return _send_ack(ser, 0x06, 0x09, payload,
                      "Konfiguration gespeichert (BBR + Flash)")
+
+# ---------------------------------------------------------------------------
+# gpsconfig.md generieren
+# ---------------------------------------------------------------------------
+
+def write_gpsconfig_md(log: dict) -> None:
+    chip    = log["chip"]
+    nav5    = log["nav5"]
+    gnss    = log["gnss"]
+    tp      = log["timepulse"]
+    saved   = log["saved"]
+    ts      = log["timestamp"]
+
+    dyn_names = {1: "Stationary", 2: "Pedestrian", 3: "Automotive",
+                 0: "Portable",   4: "Sea"}
+    fix_names = {1: "2D only", 2: "3D only", 3: "Auto 2D/3D"}
+
+    flag_bits = [
+        (0, "active",         "Timepuls aktiv"),
+        (1, "lockGnssFreq",   "GNSS-Frequenz verwenden"),
+        (2, "lockedOtherSet", "Lock-Parametersatz aktiv wenn gesynct"),
+        (3, "isFreq",         "freqPeriod in Hz (nicht µs)"),
+        (4, "isLength",       "pulseLenRatio in µs (nicht Duty-Cycle)"),
+        (5, "alignToTow",     "Puls am Time-of-Week ausrichten"),
+        (6, "polarity",       "Steigende Flanke = Sekundenanfang"),
+    ]
+
+    lines = []
+    w = lines.append
+
+    w(f"# gpsconfig.md — Letzte GPS-Konfiguration")
+    w(f"")
+    w(f"> Automatisch generiert von `ublox_config.py` am {ts}  ")
+    w(f"> **Nicht manuell bearbeiten** — wird beim nächsten Script-Lauf überschrieben.")
+    w(f"")
+
+    # Chip
+    w(f"## Chip")
+    w(f"")
+    w(f"| Parameter | Wert |")
+    w(f"|---|---|")
+    w(f"| SW Version | `{chip.get('sw', 'unbekannt')}` |")
+    w(f"| HW Version | `{chip.get('hw', 'unbekannt')}` |")
+    for e in chip.get("ext", []):
+        w(f"| Extension  | `{e}` |")
+    w(f"| Generation | NEO-{chip.get('gen', '?')}x |")
+    w(f"| Port       | `{log['port']}` |")
+    w(f"| Baudrate   | {log['baud_final']} Baud |")
+    w(f"")
+
+    # NAV5
+    status = "OK" if nav5["ok"] else "FEHLER"
+    w(f"## Stationärer Modus — `UBX-CFG-NAV5` ({status})")
+    w(f"")
+    w(f"| Parameter | Wert | Bedeutung |")
+    w(f"|---|---|---|")
+    w(f"| `dynModel` | {nav5['dynModel']} | {dyn_names.get(nav5['dynModel'], '?')} |")
+    w(f"| `fixMode`  | {nav5['fixMode']} | {fix_names.get(nav5['fixMode'], '?')} |")
+    w(f"")
+
+    # GNSS
+    if gnss.get("skipped"):
+        w(f"## GNSS Multi-System — `UBX-CFG-GNSS` (übersprungen, NEO-6/7)")
+        w(f"")
+        w(f"Nicht verfügbar auf dieser Chip-Generation.")
+    else:
+        status = "OK" if gnss["ok"] else "FEHLER"
+        w(f"## GNSS Multi-System — `UBX-CFG-GNSS` ({status})")
+        w(f"")
+        w(f"| System | Max Kanäle | Aktiviert |")
+        w(f"|---|---|---|")
+        for s in gnss["systems"]:
+            w(f"| {s['name']} | {s['max_trk']} | ja |")
+        w(f"")
+        w(f"`numTrkChUse` = 0xFF (alle verfügbaren Hardware-Kanäle)")
+    w(f"")
+
+    # Timepulse
+    status = "OK" if tp["ok"] else "FEHLER"
+    w(f"## PPS-Timepuls — `UBX-CFG-TP5` ({status})")
+    w(f"")
+    w(f"| Parameter | Wert | Bedeutung |")
+    w(f"|---|---|---|")
+    w(f"| Frequenz         | {tp['freq_hz']} Hz | Ein Puls pro Sekunde |")
+    w(f"| Pulsbreite       | {tp['pulse_us'] // 1000} ms | Länge des HIGH-Signals |")
+    w(f"| Ausrichtung      | UTC | Puls zur UTC-Sekunde ausgerichtet |")
+    w(f"| Aktivierung      | Nur wenn gelockt | Kein Puls ohne GNSS-Fix |")
+    w(f"| `antCableDelay`  | {tp['cable_ns']} ns | Antennenkabelverzögerung |")
+    w(f"| `userConfigDelay`| {tp['user_ns']} ns | Zusätzlicher Software-Delay |")
+    w(f"| `flags`          | 0x{tp['flags']:04X} | Siehe Tabelle unten |")
+    w(f"")
+    w(f"| Bit | Name | Gesetzt | Bedeutung |")
+    w(f"|---|---|---|---|")
+    for bit, name, desc in flag_bits:
+        val = "ja" if (tp["flags"] >> bit) & 1 else "nein"
+        w(f"| {bit} | `{name}` | {val} | {desc} |")
+    w(f"")
+
+    # Baudrate
+    w(f"## Baudrate — `UBX-CFG-PRT`")
+    w(f"")
+    w(f"| Parameter | Wert |")
+    w(f"|---|---|")
+    w(f"| Baudrate vorher | {log['baud_initial']} Baud |")
+    w(f"| Baudrate nachher | {log['baud_final']} Baud |")
+    w(f"| Protokoll In | UBX + NMEA |")
+    w(f"| Protokoll Out | UBX + NMEA |")
+    w(f"")
+    w(f"Arduino-Sketch anpassen:")
+    w(f"```cpp")
+    w(f"GPS_Serial.begin({log['baud_final']}, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);")
+    w(f"```")
+    w(f"")
+
+    # Speichern
+    w(f"## Gespeichert — `UBX-CFG-CFG`")
+    w(f"")
+    if saved:
+        w(f"Konfiguration dauerhaft gespeichert in BBR + Flash + EEPROM.")
+    else:
+        w(f"**Nicht gespeichert** (`--no-save` gesetzt). "
+          f"Einstellungen gehen beim Neustart verloren.")
+    w(f"")
+
+    with open(MD_PATH, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    print(f"\n  gpsconfig.md aktualisiert: {MD_PATH}")
 
 # ---------------------------------------------------------------------------
 # Main
@@ -286,16 +412,27 @@ def main():
 
     # --- Port ermitteln ---
     if args.port:
-        port        = args.port
+        port         = args.port
         current_baud = args.baud if args.baud else 9600
         print(f"Port: {port} @ {current_baud} Baud")
     else:
         print("Suche u-blox GPS Modul...")
         port, current_baud = find_ublox()
         if port is None:
-            print("FEHLER: Kein u-blox Modul gefunden. "
-                  "Port mit --port angeben oder Modul anschliessen.")
+            print("FEHLER: Kein u-blox Modul gefunden.")
             sys.exit(1)
+
+    log = {
+        "timestamp":    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "port":         port,
+        "baud_initial": current_baud,
+        "baud_final":   current_baud,
+        "chip":         {},
+        "nav5":         {},
+        "gnss":         {},
+        "timepulse":    {},
+        "saved":        False,
+    }
 
     ser = serial.Serial(port, current_baud, timeout=1.0)
     ser.reset_input_buffer()
@@ -311,20 +448,23 @@ def main():
             print(f"  EXT: {e}")
         gen = detect_generation(ver)
         print(f"  Generation: NEO-{gen}x")
+        log["chip"] = {**ver, "gen": gen}
     else:
         print("  WARNUNG: Chip-Version nicht auslesbar")
         gen = 6
+        log["chip"] = {"gen": gen}
 
     # --- Konfiguration ---
     print("\n── Konfiguration ───────────────────────────────")
-    cfg_nav5_stationary(ser)
+    log["nav5"] = cfg_nav5_stationary(ser)
 
     if gen >= 8:
-        cfg_gnss_all(ser)
+        log["gnss"] = cfg_gnss_all(ser)
     else:
         print("  SKIP GNSS Multi-System (nur M8+)")
+        log["gnss"] = {"systems": [], "ok": False, "skipped": True}
 
-    cfg_timepulse(ser)
+    log["timepulse"] = cfg_timepulse(ser)
 
     # --- Baudrate ändern ---
     if current_baud != TARGET_BAUD:
@@ -335,28 +475,29 @@ def main():
         ser = serial.Serial(port, TARGET_BAUD, timeout=1.0)
         ser.reset_input_buffer()
         time.sleep(0.3)
-        # Verbindung verifizieren
         ver2 = get_version(ser)
         if ver2:
             print(f"  OK   Verbindung bei {TARGET_BAUD} Baud bestätigt")
+            log["baud_final"] = TARGET_BAUD
         else:
-            print(f"  WARNUNG: Keine Antwort bei {TARGET_BAUD} Baud — "
-                  "Baudrate im Modul ggf. bereits anders")
+            print(f"  WARNUNG: Keine Antwort bei {TARGET_BAUD} Baud")
     else:
         print(f"\n  Baudrate bereits {TARGET_BAUD} Baud")
+        log["baud_final"] = TARGET_BAUD
 
     # --- Speichern ---
     if not args.no_save:
         print("\n── Speichern ───────────────────────────────────")
-        cfg_save(ser)
+        log["saved"] = cfg_save(ser)
 
     ser.close()
 
+    # --- gpsconfig.md schreiben ---
+    print("\n── Dokumentation ───────────────────────────────")
+    write_gpsconfig_md(log)
+
     print("\n── Fertig ──────────────────────────────────────")
     print("GPS-Modul für NTP-Betrieb konfiguriert.")
-    if current_baud != TARGET_BAUD:
-        print(f"\nArduino-Sketch anpassen (config.h oder GPStoNTP.ino):")
-        print(f"  GPS_Serial.begin({TARGET_BAUD}, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);")
 
 
 if __name__ == "__main__":
