@@ -29,7 +29,7 @@
 #define ETH_RST_PIN  9
 #define GPS_RX_PIN   1
 #define GPS_TX_PIN   2
-#define PPS_PIN      3
+#define PPS_PIN      4
 
 /* --- NETZWERK-KONFIGURATION (aus config.h) --- */
 byte mac[]       = CFG_MAC;
