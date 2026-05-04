@@ -19,6 +19,7 @@
 #include <TinyGPS++.h>
 #include <PubSubClient.h>
 #include <time.h>
+#include "esp_timer.h"
 #include "config.h"
 
 /* --- HARDWARE MAPPING --- */
@@ -51,19 +52,19 @@ PubSubClient   mqttClient(ethClient);
 TinyGPSPlus    gps;
 HardwareSerial GPS_Serial(1);
 
-/* PPS-Zeitstempel (IRAM, da ISR) */
-volatile uint32_t lastPPSMicros = 0;
-volatile uint32_t ppsCount      = 0;
+/* PPS-Zeitstempel (IRAM, da ISR) — esp_timer: 64-bit, µs, kein Überlauf */
+volatile int64_t  lastPPSus = 0;
+volatile uint32_t ppsCount  = 0;
 
 /* NTP-Zustand */
-uint32_t ntpEpoch          = 0; // NTP-Timestamp (Sekunden seit 1.1.1900)
+uint32_t ntpEpochAtLastPPS = 0; // NTP-Epoch der Sekunde, die der letzte PPS markierte
 uint32_t ntpRequestsServed = 0;
 
 /* ------------------------------------------------------------------ */
-/*  Interrupt: PPS-Flanke merken                                        */
+/*  Interrupt: PPS-Flanke per Hardware-Timer laten                      */
 /* ------------------------------------------------------------------ */
 void IRAM_ATTR ppsHandler() {
-  lastPPSMicros = micros();
+  lastPPSus = esp_timer_get_time(); // Hardware-Timer, direkt beim Edge gelesen
   ppsCount++;
 }
 
@@ -106,7 +107,9 @@ void loop() {
     gps.encode(GPS_Serial.read());
   }
 
-  // GPS-Zeit → NTP-Epoch aktualisieren
+  // GPS-Zeit → NTP-Epoch auf letzten PPS-Puls einrasten
+  // Die NMEA-Sentence kommt 100–400 ms nach dem PPS-Puls und gibt die Zeit
+  // der gerade gestarteten Sekunde an — also exakt die Sekunde des letzten PPS.
   if (gps.time.isUpdated() && gps.date.isValid()) {
     struct tm t;
     t.tm_year  = gps.date.year() - 1900;
@@ -116,8 +119,7 @@ void loop() {
     t.tm_min   = gps.time.minute();
     t.tm_sec   = gps.time.second();
     t.tm_isdst = 0;
-    // Unix-Zeit + Offset 1900→1970 ergibt NTP-Timestamp
-    ntpEpoch = (uint32_t)mktime(&t) + 2208988800UL;
+    ntpEpochAtLastPPS = (uint32_t)mktime(&t) + 2208988800UL;
   }
 
   // Eingehende NTP-Anfragen beantworten
@@ -143,11 +145,15 @@ void handleNTPRequest() {
   byte packetBuffer[48];
   ntpUDP.read(packetBuffer, 48);
 
-  // Sub-Sekunden-Anteil aus PPS-Abstand berechnen
-  uint32_t usSincePPS = micros() - lastPPSMicros;
-  if (usSincePPS > 1000000) usSincePPS = 0; // PPS älter als 1 s → verwerfen
-  // µs → NTP-Fraction (2^32 / 1e6 ≈ 4294.967296)
-  uint32_t fraction = (uint32_t)(usSincePPS * 4294.967296);
+  // Verstrichene µs seit letztem PPS — Hardware-Timer, kein Float
+  int64_t  usSincePPS64 = esp_timer_get_time() - lastPPSus;
+  if (usSincePPS64 < 0 || usSincePPS64 >= 1000000) usSincePPS64 = 0;
+  uint32_t usSincePPS   = (uint32_t)usSincePPS64;
+
+  // Aktuelle Sekunde = PPS-Epoch + ggf. überrollte Sekunde (sollte 0 sein)
+  uint32_t txSeconds  = ntpEpochAtLastPPS + (uint32_t)(usSincePPS / 1000000);
+  // µs → NTP-Fraction: (µs * 2^32) / 1e6, reine Integer-Arithmetik
+  uint32_t txFraction = (uint32_t)(((uint64_t)usSincePPS * 4294967296ULL) / 1000000ULL);
 
   byte reply[48];
   memset(reply, 0, 48);
@@ -162,14 +168,14 @@ void handleNTPRequest() {
   memcpy(&reply[12], "GPS ", 4);
 
   // Transmit Timestamp (Seconds + Fraction)
-  reply[40] = (ntpEpoch >> 24) & 0xFF;
-  reply[41] = (ntpEpoch >> 16) & 0xFF;
-  reply[42] = (ntpEpoch >>  8) & 0xFF;
-  reply[43] =  ntpEpoch        & 0xFF;
-  reply[44] = (fraction >> 24) & 0xFF;
-  reply[45] = (fraction >> 16) & 0xFF;
-  reply[46] = (fraction >>  8) & 0xFF;
-  reply[47] =  fraction        & 0xFF;
+  reply[40] = (txSeconds  >> 24) & 0xFF;
+  reply[41] = (txSeconds  >> 16) & 0xFF;
+  reply[42] = (txSeconds  >>  8) & 0xFF;
+  reply[43] =  txSeconds         & 0xFF;
+  reply[44] = (txFraction >> 24) & 0xFF;
+  reply[45] = (txFraction >> 16) & 0xFF;
+  reply[46] = (txFraction >>  8) & 0xFF;
+  reply[47] =  txFraction        & 0xFF;
 
   ntpUDP.beginPacket(ntpUDP.remoteIP(), ntpUDP.remotePort());
   ntpUDP.write(reply, 48);
