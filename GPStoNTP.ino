@@ -139,43 +139,68 @@ void loop() {
 }
 
 /* ------------------------------------------------------------------ */
+/*  Hilfsfunktion: µs-seit-PPS → NTP-Seconds + Fraction                */
+/* ------------------------------------------------------------------ */
+static inline void usToNTP(int64_t timerUs, uint32_t &sec, uint32_t &frac) {
+  int64_t delta = timerUs - lastPPSus;
+  if (delta < 0 || delta >= 2000000) delta = 0; // ungültig → 0
+  sec  = ntpEpochAtLastPPS + (uint32_t)(delta / 1000000);
+  frac = (uint32_t)(((uint64_t)(delta % 1000000) * 4294967296ULL) / 1000000ULL);
+}
+
+/* ------------------------------------------------------------------ */
 /*  NTP-Antwort senden (RFC 4330)                                       */
 /* ------------------------------------------------------------------ */
 void handleNTPRequest() {
+  // Empfangszeitpunkt so früh wie möglich stempeln (T2)
+  int64_t rxTimerUs = esp_timer_get_time();
+
   byte packetBuffer[48];
   ntpUDP.read(packetBuffer, 48);
 
-  // Verstrichene µs seit letztem PPS — Hardware-Timer, kein Float
-  int64_t  usSincePPS64 = esp_timer_get_time() - lastPPSus;
-  if (usSincePPS64 < 0 || usSincePPS64 >= 1000000) usSincePPS64 = 0;
-  uint32_t usSincePPS   = (uint32_t)usSincePPS64;
+  uint32_t refSec, refFrac, rxSec, rxFrac, txSec, txFrac;
 
-  // Aktuelle Sekunde = PPS-Epoch + ggf. überrollte Sekunde (sollte 0 sein)
-  uint32_t txSeconds  = ntpEpochAtLastPPS + (uint32_t)(usSincePPS / 1000000);
-  // µs → NTP-Fraction: (µs * 2^32) / 1e6, reine Integer-Arithmetik
-  uint32_t txFraction = (uint32_t)(((uint64_t)usSincePPS * 4294967296ULL) / 1000000ULL);
+  // Reference Timestamp: Zeitpunkt des letzten GPS/PPS-Sync (Fraction = 0,
+  // da PPS per Definition die exakte Sekundengrenze markiert)
+  refSec  = ntpEpochAtLastPPS;
+  refFrac = 0;
+
+  // Receive Timestamp (T2): wann traf das Paket ein
+  usToNTP(rxTimerUs, rxSec, rxFrac);
+
+  // Transmit Timestamp (T3): unmittelbar vor dem Senden
+  usToNTP(esp_timer_get_time(), txSec, txFrac);
 
   byte reply[48];
   memset(reply, 0, 48);
 
-  // LI=0, VN=4, Mode=4 (server), Stratum=1, Poll=0, Precision=-15
-  reply[0] = 0b00100100;
-  reply[1] = 1;
-  reply[2] = 0;
-  reply[3] = (byte)-15;
+  // Byte 0: LI=0, VN=4, Mode=4 (server)  Byte 1: Stratum=1
+  // Byte 2: Poll=0                        Byte 3: Precision=-15
+  reply[0] = 0b00100100; reply[1] = 1; reply[2] = 0; reply[3] = (byte)-15;
 
-  // Reference Identifier: "GPS "
+  // Reference Identifier (bytes 12–15): "GPS "
   memcpy(&reply[12], "GPS ", 4);
 
-  // Transmit Timestamp (Seconds + Fraction)
-  reply[40] = (txSeconds  >> 24) & 0xFF;
-  reply[41] = (txSeconds  >> 16) & 0xFF;
-  reply[42] = (txSeconds  >>  8) & 0xFF;
-  reply[43] =  txSeconds         & 0xFF;
-  reply[44] = (txFraction >> 24) & 0xFF;
-  reply[45] = (txFraction >> 16) & 0xFF;
-  reply[46] = (txFraction >>  8) & 0xFF;
-  reply[47] =  txFraction        & 0xFF;
+  // Reference Timestamp (bytes 16–23)
+  reply[16] = (refSec  >> 24) & 0xFF; reply[17] = (refSec  >> 16) & 0xFF;
+  reply[18] = (refSec  >>  8) & 0xFF; reply[19] =  refSec         & 0xFF;
+  reply[20] = (refFrac >> 24) & 0xFF; reply[21] = (refFrac >> 16) & 0xFF;
+  reply[22] = (refFrac >>  8) & 0xFF; reply[23] =  refFrac        & 0xFF;
+
+  // Origin Timestamp (bytes 24–31): T1 des Clients unverändert zurück
+  memcpy(&reply[24], &packetBuffer[40], 8);
+
+  // Receive Timestamp (bytes 32–39): T2
+  reply[32] = (rxSec  >> 24) & 0xFF; reply[33] = (rxSec  >> 16) & 0xFF;
+  reply[34] = (rxSec  >>  8) & 0xFF; reply[35] =  rxSec         & 0xFF;
+  reply[36] = (rxFrac >> 24) & 0xFF; reply[37] = (rxFrac >> 16) & 0xFF;
+  reply[38] = (rxFrac >>  8) & 0xFF; reply[39] =  rxFrac        & 0xFF;
+
+  // Transmit Timestamp (bytes 40–47): T3
+  reply[40] = (txSec  >> 24) & 0xFF; reply[41] = (txSec  >> 16) & 0xFF;
+  reply[42] = (txSec  >>  8) & 0xFF; reply[43] =  txSec         & 0xFF;
+  reply[44] = (txFrac >> 24) & 0xFF; reply[45] = (txFrac >> 16) & 0xFF;
+  reply[46] = (txFrac >>  8) & 0xFF; reply[47] =  txFrac        & 0xFF;
 
   ntpUDP.beginPacket(ntpUDP.remoteIP(), ntpUDP.remotePort());
   ntpUDP.write(reply, 48);
