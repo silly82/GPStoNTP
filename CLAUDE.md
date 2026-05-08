@@ -32,22 +32,27 @@ Sets dynModel=Stationary, all GNSS systems on, PPS 1 Hz UTC-aligned, UART1 → 1
 **Timing chain** (the core of the design):
 
 ```
-PPS rising edge → ISR: lastPPSus = esp_timer_get_time()   (64-bit µs, IRAM)
-NMEA sentence (arrives 100–400 ms after PPS, carries time of that second)
-  → ntpEpochAtLastPPS = mktime(gps.time/date) + 2208988800UL
-NTP request arrives → rxTimerUs = esp_timer_get_time()
-  → Δt = rxTimerUs - lastPPSus
-  → sec  = ntpEpochAtLastPPS + Δt / 1e6
-  → frac = (Δt % 1e6) × 2³² / 1e6
+PPS rising edge  → ISR (ppsHandler):   lastPPSus = esp_timer_get_time()
+NMEA sentence    → GPS task (Core 0):  ntpEpochAtLastPPS = mktime(...) + 2208988800UL
+W5500 INT falls  → ISR (ethIntHandler): rxTimerUs = esp_timer_get_time()
+loop() (Core 1) sees parsePacket() ≥ 48:
+  T2: rxTimerUs (ISR-captured, pre-SPI-overhead)
+  T3: esp_timer_get_time() just before send
+  Δt = Tx - lastPPSus → sec + fraction
 ```
 
-Key invariant: `ntpEpochAtLastPPS` and `lastPPSus` are always a matched pair — both represent the same PPS edge. The NMEA latency (100–400 ms) doesn't introduce error because the sentence always carries the time of the *last* PPS second.
+Key invariants:
+- `ntpEpochAtLastPPS` and `lastPPSus` are always a matched pair (same PPS edge). NMEA latency (100–400 ms) doesn't matter because the sentence always carries the time of the *last* PPS second.
+- `rxTimerUs` is written by ISR on W5500 INT falling edge — before `parsePacket()` SPI overhead (~100–500 µs). Gives T2 accuracy of ~2–7 µs.
+- GPS parsing runs on Core 0 (`gpsTask`), NTP loop runs on Core 1 (`loop()`). No GPS jitter on the NTP path. `ntpEpochAtLastPPS`, `gpsSats`, `gpsHdop` are `volatile` for cross-core visibility (32-bit aligned → atomically read/written on ESP32).
+- W5500 interrupt configuration (`Sn_IMR`, `IMR`) must happen **after** `ntpUDP.begin(123)`.
 
 **Pin mapping** (defined as constants in `GPStoNTP.ino`):
 
 | Signal | Pin |
 |---|---|
 | W5500 SCLK/MISO/MOSI/CS/RST | 13/12/11/14/9 |
+| W5500 INT | 5 (`ETH_INT_PIN`, aktiv-LOW, neues Kabel erforderlich) |
 | GPS RX/TX | 1/2 |
 | PPS | 4 |
 
