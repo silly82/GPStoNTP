@@ -1,0 +1,27 @@
+; pps_capture.pio
+; Rising-edge-Detektor für PPS-Signal → löst PIO-IRQ 0 aus.
+; CPU-ISR liest time_us_64() innerhalb ~80–150 ns (M33-Interrupt-Latenz).
+;
+; Verwendung:
+;   pps_capture_program_init(pio0, 0, offset, PPS_PIN);
+;   pio_set_irq0_source_enabled(pio0, pis_interrupt0, true);
+
+.program pps_capture
+
+.wrap_target
+    wait 0 pin 0     ; warte bis Pin LOW (Re-Arming nach letztem Puls)
+    wait 1 pin 0     ; steigende Flanke erkannt
+    irq nowait 0     ; IRQ 0 auslösen, PIO läuft sofort weiter
+.wrap
+
+% c-sdk {
+static inline void pps_capture_program_init(PIO pio, uint sm, uint offset, uint pin) {
+    pio_sm_config c = pps_capture_program_get_default_config(offset);
+    pio_gpio_init(pio, pin);
+    pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, false);
+    sm_config_set_in_pins(&c, pin);
+    sm_config_set_clkdiv(&c, 1.0f); // volle Systemfrequenz (150 MHz)
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}

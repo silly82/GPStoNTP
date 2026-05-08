@@ -1,0 +1,30 @@
+; eth_int_capture.pio
+; Falling-edge-Detektor für W6300 INTn (aktiv-LOW) → löst PIO-IRQ 1 aus.
+; CPU-ISR liest time_us_64() als T2-Timestamp.
+;
+; Wartet nach dem IRQ bis INTn wieder HIGH geht (durch w6300ClearRecvInt()),
+; damit pro Paket genau ein IRQ ausgelöst wird.
+;
+; Verwendung:
+;   eth_int_capture_program_init(pio0, 1, offset, ETH_INT_PIN);
+;   pio_set_irq0_source_enabled(pio0, pis_interrupt1, true);
+
+.program eth_int_capture
+
+.wrap_target
+    wait 1 pin 0     ; warte bis INTn HIGH (deassertiert/quittiert)
+    wait 0 pin 0     ; fallende Flanke = Paket eingetroffen
+    irq nowait 1     ; IRQ 1 auslösen
+.wrap
+
+% c-sdk {
+static inline void eth_int_capture_program_init(PIO pio, uint sm, uint offset, uint pin) {
+    pio_sm_config c = eth_int_capture_program_get_default_config(offset);
+    pio_gpio_init(pio, pin);
+    pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, false);
+    sm_config_set_in_pins(&c, pin);
+    sm_config_set_clkdiv(&c, 1.0f);
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}
