@@ -1,0 +1,103 @@
+; w6300_qspi.pio — W6300 QSPI-Treiber für RP2350 (PIO1)
+;
+; Drei State Machines auf PIO1, alle teilen denselben SCLK-Pin (side-set):
+;   SM0  spi_cmd    — Single-SPI TX (Command + Address-Phase, IO0 only)
+;   SM1  qspi_write — Quad-SPI TX (Data-Write-Phase, IO0-IO3)
+;   SM2  qspi_read  — Quad-SPI RX (Data-Read-Phase, IO0-IO3)
+;
+; Pin-Mapping (W6300-EVB-Pico2):
+;   SCLK  = GPIO17   (side-set bit 0)
+;   IO0   = GPIO18   (MOSI / Quad-IO0)
+;   IO1   = GPIO19   (MISO / Quad-IO1)
+;   IO2   = GPIO20   (Quad-IO2)
+;   IO3   = GPIO21   (Quad-IO3)
+;
+; QSPI-Protokoll W6300:
+;   Write : opcode 0x02 + 3-Byte-Addr (single SPI) + data (quad SPI)
+;   Read  : opcode 0x6B + 3-Byte-Addr (single SPI) + dummy (single) + data (quad SPI)
+;
+; CS (GPIO16) wird von der CPU gesteuert — Transaktionen sind zu kurz für PIO-CS.
+
+; ============================================================
+; SM0 — spi_cmd: Single-SPI TX (IO0, MSB-first)
+; ============================================================
+.program spi_cmd
+.side_set 1              ; bit 0 = SCLK
+
+.wrap_target
+    out pins, 1  side 0  ; IO0 = nächstes Bit, SCLK LOW
+    nop          side 1  ; SCLK HIGH → W6300 sampelt IO0
+.wrap
+
+% c-sdk {
+static inline void spi_cmd_init(PIO pio, uint sm, uint offset,
+                                uint io0_pin, uint sclk_pin, float clkdiv) {
+    pio_sm_config c = spi_cmd_program_get_default_config(offset);
+    sm_config_set_sideset_pins(&c, sclk_pin);
+    sm_config_set_out_pins(&c, io0_pin, 1);
+    // MSB-first, autopull bei 8 Bit
+    sm_config_set_out_shift(&c, false, true, 8);
+    sm_config_set_clkdiv(&c, clkdiv);
+    pio_gpio_init(pio, io0_pin);
+    pio_gpio_init(pio, sclk_pin);
+    pio_sm_set_consecutive_pindirs(pio, sm, io0_pin, 1, true);
+    pio_sm_set_consecutive_pindirs(pio, sm, sclk_pin, 1, true);
+    gpio_put(sclk_pin, 0); // SCLK idle LOW
+    pio_sm_init(pio, sm, offset, &c);
+}
+%}
+
+; ============================================================
+; SM1 — qspi_write: Quad-SPI TX (IO0-IO3, MSB-first, nibble-weise)
+; ============================================================
+.program qspi_write
+.side_set 1
+
+.wrap_target
+    out pins, 4  side 0  ; IO0-IO3 = nächstes Nibble, SCLK LOW
+    nop          side 1  ; SCLK HIGH → W6300 sampelt IO0-IO3
+.wrap
+
+% c-sdk {
+static inline void qspi_write_init(PIO pio, uint sm, uint offset,
+                                   uint io0_pin, uint sclk_pin, float clkdiv) {
+    pio_sm_config c = qspi_write_program_get_default_config(offset);
+    sm_config_set_sideset_pins(&c, sclk_pin);
+    sm_config_set_out_pins(&c, io0_pin, 4);
+    // MSB-first, autopull bei 32 Bit (4 Bytes pro FIFO-Wort)
+    sm_config_set_out_shift(&c, false, true, 32);
+    sm_config_set_clkdiv(&c, clkdiv);
+    for (int i = 0; i < 4; i++) pio_gpio_init(pio, io0_pin + i);
+    pio_gpio_init(pio, sclk_pin);
+    pio_sm_set_consecutive_pindirs(pio, sm, sclk_pin, 1, true);
+    // IO0-IO3 werden je nach Phase als Output/Input gesetzt
+    pio_sm_init(pio, sm, offset, &c);
+}
+%}
+
+; ============================================================
+; SM2 — qspi_read: Quad-SPI RX (IO0-IO3, MSB-first, nibble-weise)
+; ============================================================
+.program qspi_read
+.side_set 1
+
+.wrap_target
+    nop         side 0   ; SCLK LOW (W6300 legt nächstes Nibble an)
+    in  pins, 4 side 1   ; SCLK HIGH → sampeln IO0-IO3
+.wrap
+
+% c-sdk {
+static inline void qspi_read_init(PIO pio, uint sm, uint offset,
+                                  uint io0_pin, uint sclk_pin, float clkdiv) {
+    pio_sm_config c = qspi_read_program_get_default_config(offset);
+    sm_config_set_sideset_pins(&c, sclk_pin);
+    sm_config_set_in_pins(&c, io0_pin);
+    // MSB-first, autopush bei 32 Bit
+    sm_config_set_in_shift(&c, false, true, 32);
+    sm_config_set_clkdiv(&c, clkdiv);
+    for (int i = 0; i < 4; i++) pio_gpio_init(pio, io0_pin + i);
+    pio_gpio_init(pio, sclk_pin);
+    pio_sm_set_consecutive_pindirs(pio, sm, sclk_pin, 1, true);
+    pio_sm_init(pio, sm, offset, &c);
+}
+%}
