@@ -24,6 +24,7 @@
 #include <EthernetUdp.h>
 #include <TinyGPS++.h>
 #include <PubSubClient.h>
+#include <atomic>
 #include <time.h>
 #include "esp_timer.h"
 #include "config.h"
@@ -66,13 +67,31 @@ volatile uint32_t ppsCount  = 0;
 /* W5500 INT: T2-Stempel, von ISR auf falling edge gesetzt */
 volatile int64_t rxTimerUs = 0;
 
-/* NTP-Zustand — volatile: Core 0 schreibt, Core 1 liest */
-volatile uint32_t ntpEpochAtLastPPS = 0;
+/* NTP-Zustand — atomic: Core 0 schreibt (release), Core 1 liest (acquire) */
+std::atomic<uint32_t> ntpEpochAtLastPPS{0};
 uint32_t ntpRequestsServed = 0;
 
 /* GPS-Statuscache für MQTT — Core 0 schreibt, Core 1 liest */
 volatile uint8_t gpsSats = 0;
 volatile float   gpsHdop = 99.0f;
+
+/* ------------------------------------------------------------------ */
+/*  Atomares Lesen von 64-bit ISR-Variablen (Torn-Read-Schutz)         */
+/*  Beide ISRs laufen auf Core 1 → Interrupt-Disable genügt.          */
+/* ------------------------------------------------------------------ */
+static inline int64_t readLastPPS() {
+  portDISABLE_INTERRUPTS();
+  int64_t v = lastPPSus;
+  portENABLE_INTERRUPTS();
+  return v;
+}
+
+static inline int64_t readRxTimer() {
+  portDISABLE_INTERRUPTS();
+  int64_t v = rxTimerUs;
+  portENABLE_INTERRUPTS();
+  return v;
+}
 
 /* ------------------------------------------------------------------ */
 /*  W5500 Direktzugriff (20 MHz SPI)                                   */
@@ -127,7 +146,7 @@ void gpsTask(void*) {
       t.tm_min   = gps.time.minute();
       t.tm_sec   = gps.time.second();
       t.tm_isdst = 0;
-      ntpEpochAtLastPPS = (uint32_t)mktime(&t) + 2208988800UL;
+      ntpEpochAtLastPPS.store((uint32_t)mktime(&t) + 2208988800UL, std::memory_order_release);
     }
     gpsSats = (uint8_t)gps.satellites.value();
     gpsHdop = gps.hdop.hdop();
@@ -200,9 +219,9 @@ void loop() {
 /*  Hilfsfunktion: µs-seit-PPS → NTP-Seconds + Fraction               */
 /* ------------------------------------------------------------------ */
 static inline void usToNTP(int64_t timerUs, uint32_t &sec, uint32_t &frac) {
-  int64_t delta = timerUs - lastPPSus;
+  int64_t delta = timerUs - readLastPPS();
   if (delta < 0 || delta >= 2000000) delta = 0;
-  sec  = ntpEpochAtLastPPS + (uint32_t)(delta / 1000000);
+  sec  = ntpEpochAtLastPPS.load(std::memory_order_acquire) + (uint32_t)(delta / 1000000);
   frac = (uint32_t)(((uint64_t)(delta % 1000000) * 4294967296ULL) / 1000000ULL);
 }
 
@@ -211,14 +230,14 @@ static inline void usToNTP(int64_t timerUs, uint32_t &sec, uint32_t &frac) {
 /* ------------------------------------------------------------------ */
 void handleNTPRequest() {
   // T2: von ISR gestempelt, bevor parsePacket() SPI-Overhead anfiel
-  int64_t t2 = rxTimerUs;
+  int64_t t2 = readRxTimer();
 
   byte packetBuffer[48];
   ntpUDP.read(packetBuffer, 48);
 
   uint32_t refSec, refFrac, rxSec, rxFrac, txSec, txFrac;
 
-  refSec  = ntpEpochAtLastPPS;
+  refSec  = ntpEpochAtLastPPS.load(std::memory_order_acquire);
   refFrac = 0;
 
   usToNTP(t2, rxSec, rxFrac);
