@@ -6,7 +6,7 @@
  *   - W5500 Ethernet-Modul (SPI)
  *   - GPS-Modul mit NMEA-Ausgang (UART, 115200 Baud)
  *   - PPS-Ausgang des GPS-Moduls für präzisen 1-Hz-Takt
- *   - W5500 INT-Pin → ETH_INT_PIN (neues Kabel, aktiv-LOW)
+ *   - W5500 INT-Pin → GPIO10 (auf Waveshare ESP32-S3-ETH bereits verdrahtet)
  *
  * Latenz-Optimierungen:
  *   - W5500 INT-Pin: T2 per ISR stempeln (vor parsePacket-Polling)
@@ -34,7 +34,7 @@
 #define ETH_MOSI_PIN  11
 #define ETH_CS_PIN    14
 #define ETH_RST_PIN   9
-#define ETH_INT_PIN   5   // W5500 INT → GPIO5 (aktiv-LOW, neues Kabel nötig)
+#define ETH_INT_PIN   10  // W5500 INT → GPIO10 (auf Waveshare ESP32-S3-ETH fest verdrahtet)
 #define GPS_RX_PIN    1
 #define GPS_TX_PIN    2
 #define PPS_PIN       4

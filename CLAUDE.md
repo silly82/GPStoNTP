@@ -46,13 +46,14 @@ Key invariants:
 - `rxTimerUs` is written by ISR on W5500 INT falling edge — before `parsePacket()` SPI overhead (~100–500 µs). Gives T2 accuracy of ~2–7 µs.
 - GPS parsing runs on Core 0 (`gpsTask`), NTP loop runs on Core 1 (`loop()`). No GPS jitter on the NTP path. `ntpEpochAtLastPPS`, `gpsSats`, `gpsHdop` are `volatile` for cross-core visibility (32-bit aligned → atomically read/written on ESP32).
 - W5500 interrupt configuration (`Sn_IMR`, `IMR`) must happen **after** `ntpUDP.begin(123)`.
+- Board: **Waveshare ESP32-S3-ETH** — W5500 INT is hardwired to GPIO 10, no extra cable needed.
 
 **Pin mapping** (defined as constants in `GPStoNTP.ino`):
 
 | Signal | Pin |
 |---|---|
 | W5500 SCLK/MISO/MOSI/CS/RST | 13/12/11/14/9 |
-| W5500 INT | 5 (`ETH_INT_PIN`, aktiv-LOW, neues Kabel erforderlich) |
+| W5500 INT | 10 (`ETH_INT_PIN`, auf Waveshare ESP32-S3-ETH fest verdrahtet) |
 | GPS RX/TX | 1/2 |
 | PPS | 4 |
 
