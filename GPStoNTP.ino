@@ -6,6 +6,12 @@
  *   - W5500 Ethernet-Modul (SPI)
  *   - GPS-Modul mit NMEA-Ausgang (UART, 115200 Baud)
  *   - PPS-Ausgang des GPS-Moduls für präzisen 1-Hz-Takt
+ *   - W5500 INT-Pin → GPIO10 (auf Waveshare ESP32-S3-ETH bereits verdrahtet)
+ *
+ * Latenz-Optimierungen:
+ *   - W5500 INT-Pin: T2 per ISR stempeln (vor parsePacket-Polling)
+ *   - GPS-Parsing auf Core 0 (FreeRTOS Task), NTP-Loop auf Core 1 jitterfrei
+ *   - SPI 20 MHz für direkten W5500-Registerzugriff
  *
  * Abhängigkeiten (Arduino Library Manager):
  *   - Ethernet          (Arduino)
@@ -18,19 +24,21 @@
 #include <EthernetUdp.h>
 #include <TinyGPS++.h>
 #include <PubSubClient.h>
+#include <atomic>
 #include <time.h>
 #include "esp_timer.h"
 #include "config.h"
 
 /* --- HARDWARE MAPPING --- */
-#define ETH_SCLK_PIN 13
-#define ETH_MISO_PIN 12
-#define ETH_MOSI_PIN 11
-#define ETH_CS_PIN   14
-#define ETH_RST_PIN  9
-#define GPS_RX_PIN   1
-#define GPS_TX_PIN   2
-#define PPS_PIN      4
+#define ETH_SCLK_PIN  13
+#define ETH_MISO_PIN  12
+#define ETH_MOSI_PIN  11
+#define ETH_CS_PIN    14
+#define ETH_RST_PIN   9
+#define ETH_INT_PIN   10  // W5500 INT → GPIO10 (auf Waveshare ESP32-S3-ETH fest verdrahtet)
+#define GPS_RX_PIN    1
+#define GPS_TX_PIN    2
+#define PPS_PIN       3
 
 /* --- NETZWERK-KONFIGURATION (aus config.h) --- */
 byte mac[]       = CFG_MAC;
@@ -49,23 +57,101 @@ const char* mqtt_topic  = CFG_MQTT_TOPIC;
 EthernetUDP    ntpUDP;
 EthernetClient ethClient;
 PubSubClient   mqttClient(ethClient);
-TinyGPSPlus    gps;
+TinyGPSPlus    gps;           // nur von Core 0 (gpsTask) verwendet
 HardwareSerial GPS_Serial(1);
 
-/* PPS-Zeitstempel (IRAM, da ISR) — esp_timer: 64-bit, µs, kein Überlauf */
+/* PPS-Zeitstempel (IRAM, da ISR) — esp_timer: 64-bit µs, kein Überlauf */
 volatile int64_t  lastPPSus = 0;
 volatile uint32_t ppsCount  = 0;
 
-/* NTP-Zustand */
-uint32_t ntpEpochAtLastPPS = 0; // NTP-Epoch der Sekunde, die der letzte PPS markierte
+/* W5500 INT: T2-Stempel, von ISR auf falling edge gesetzt */
+volatile int64_t rxTimerUs = 0;
+
+/* NTP-Zustand — atomic: Core 0 schreibt (release), Core 1 liest (acquire) */
+std::atomic<uint32_t> ntpEpochAtLastPPS{0};
 uint32_t ntpRequestsServed = 0;
 
+/* GPS-Statuscache für MQTT — Core 0 schreibt, Core 1 liest */
+volatile uint8_t gpsSats = 0;
+volatile float   gpsHdop = 99.0f;
+
 /* ------------------------------------------------------------------ */
-/*  Interrupt: PPS-Flanke per Hardware-Timer latchen                    */
+/*  Atomares Lesen von 64-bit ISR-Variablen (Torn-Read-Schutz)         */
+/*  Beide ISRs laufen auf Core 1 → Interrupt-Disable genügt.          */
+/* ------------------------------------------------------------------ */
+static inline int64_t readLastPPS() {
+  portDISABLE_INTERRUPTS();
+  int64_t v = lastPPSus;
+  portENABLE_INTERRUPTS();
+  return v;
+}
+
+static inline int64_t readRxTimer() {
+  portDISABLE_INTERRUPTS();
+  int64_t v = rxTimerUs;
+  portENABLE_INTERRUPTS();
+  return v;
+}
+
+/* ------------------------------------------------------------------ */
+/*  W5500 Direktzugriff (20 MHz SPI)                                   */
+/*  bsb: 0 = Common Register Block, 1 = Socket-0-Register-Block        */
+/* ------------------------------------------------------------------ */
+static void w5500Write(uint16_t addr, uint8_t bsb, uint8_t data) {
+  uint8_t cb = (bsb << 3) | 0x04; // BSB[4:0] | Write | VDM
+  SPI.beginTransaction(SPISettings(20000000, MSBFIRST, SPI_MODE0));
+  digitalWrite(ETH_CS_PIN, LOW);
+  SPI.transfer(addr >> 8);
+  SPI.transfer(addr & 0xFF);
+  SPI.transfer(cb);
+  SPI.transfer(data);
+  digitalWrite(ETH_CS_PIN, HIGH);
+  SPI.endTransaction();
+}
+
+/* Sn_IR RECV-Bit löschen → INT-Pin deassertieren */
+static void w5500ClearRecvInt() {
+  w5500Write(0x0002, 1, 0x04); // Socket-0 Sn_IR: RECV-Bit (W1C)
+}
+
+/* ------------------------------------------------------------------ */
+/*  ISR: PPS-Flanke                                                     */
 /* ------------------------------------------------------------------ */
 void IRAM_ATTR ppsHandler() {
-  lastPPSus = esp_timer_get_time(); // Hardware-Timer, direkt beim Edge gelesen
+  lastPPSus = esp_timer_get_time();
   ppsCount++;
+}
+
+/* ------------------------------------------------------------------ */
+/*  ISR: W5500 INT — T2 vor jedem parsePacket-Overhead stempeln        */
+/* ------------------------------------------------------------------ */
+void IRAM_ATTR ethIntHandler() {
+  rxTimerUs = esp_timer_get_time();
+}
+
+/* ------------------------------------------------------------------ */
+/*  GPS-Task auf Core 0 — hält NTP-Loop auf Core 1 jitterfrei          */
+/* ------------------------------------------------------------------ */
+void gpsTask(void*) {
+  for (;;) {
+    while (GPS_Serial.available()) {
+      gps.encode(GPS_Serial.read());
+    }
+    if (gps.time.isUpdated() && gps.date.isValid()) {
+      struct tm t;
+      t.tm_year  = gps.date.year() - 1900;
+      t.tm_mon   = gps.date.month() - 1;
+      t.tm_mday  = gps.date.day();
+      t.tm_hour  = gps.time.hour();
+      t.tm_min   = gps.time.minute();
+      t.tm_sec   = gps.time.second();
+      t.tm_isdst = 0;
+      ntpEpochAtLastPPS.store((uint32_t)mktime(&t) + 2208988800UL, std::memory_order_release);
+    }
+    gpsSats = (uint8_t)gps.satellites.value();
+    gpsHdop = gps.hdop.hdop();
+    vTaskDelay(1);
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -85,51 +171,42 @@ void setup() {
   Ethernet.begin(mac, ip, dns, gateway, subnet);
   ntpUDP.begin(123);
 
+  // W5500 Socket-0 RECV-Interrupt → INT-Pin aktivieren
+  // Reihenfolge: nach ntpUDP.begin(), da die Library Sn_IMR zurücksetzen könnte
+  w5500Write(0x002C, 1, 0x04); // Sn_IMR (Socket 0): RECV-Bit setzen
+  w5500Write(0x0016, 0, 0x01); // IMR (Common): Socket-0-Interrupt freigeben
+  w5500ClearRecvInt();          // etwaigen Init-Pegel quittieren
+
   // MQTT
   mqttClient.setServer(mqtt_server, 1883);
 
   // GPS-UART (115200 Baud, konfiguriert via ublox_config.py)
   GPS_Serial.begin(115200, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
 
-  // PPS-Interrupt auf steigende Flanke
+  // GPS-Task auf Core 0
+  xTaskCreatePinnedToCore(gpsTask, "GPS", 4096, NULL, 1, NULL, 0);
+
+  // Interrupts
   pinMode(PPS_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(PPS_PIN), ppsHandler, RISING);
+
+  pinMode(ETH_INT_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(ETH_INT_PIN), ethIntHandler, FALLING);
 
   Serial.println("Stratum-1 Server bereit.");
 }
 
 /* ------------------------------------------------------------------ */
-/*  loop                                                                */
+/*  loop — Core 1, nur NTP + MQTT                                       */
 /* ------------------------------------------------------------------ */
 void loop() {
-  // GPS-Daten einlesen und parsen
-  while (GPS_Serial.available()) {
-    gps.encode(GPS_Serial.read());
-  }
-
-  // GPS-Zeit → NTP-Epoch auf letzten PPS-Puls einrasten
-  // Die NMEA-Sentence kommt 100–400 ms nach dem PPS-Puls und gibt die Zeit
-  // der gerade gestarteten Sekunde an — also exakt die Sekunde des letzten PPS.
-  if (gps.time.isUpdated() && gps.date.isValid()) {
-    struct tm t;
-    t.tm_year  = gps.date.year() - 1900;
-    t.tm_mon   = gps.date.month() - 1;
-    t.tm_mday  = gps.date.day();
-    t.tm_hour  = gps.time.hour();
-    t.tm_min   = gps.time.minute();
-    t.tm_sec   = gps.time.second();
-    t.tm_isdst = 0;
-    ntpEpochAtLastPPS = (uint32_t)mktime(&t) + 2208988800UL;
-  }
-
-  // Eingehende NTP-Anfragen beantworten
   int packetSize = ntpUDP.parsePacket();
   if (packetSize >= 48) {
     handleNTPRequest();
+    w5500ClearRecvInt();
     ntpRequestsServed++;
   }
 
-  // MQTT-Status alle 30 s senden
   static uint32_t lastMQTT = 0;
   if (millis() - lastMQTT > 30000) {
     sendMQTTStatus();
@@ -139,36 +216,31 @@ void loop() {
 }
 
 /* ------------------------------------------------------------------ */
-/*  Hilfsfunktion: µs-seit-PPS → NTP-Seconds + Fraction                */
+/*  Hilfsfunktion: µs-seit-PPS → NTP-Seconds + Fraction               */
 /* ------------------------------------------------------------------ */
 static inline void usToNTP(int64_t timerUs, uint32_t &sec, uint32_t &frac) {
-  int64_t delta = timerUs - lastPPSus;
-  if (delta < 0 || delta >= 2000000) delta = 0; // ungültig → 0
-  sec  = ntpEpochAtLastPPS + (uint32_t)(delta / 1000000);
+  int64_t delta = timerUs - readLastPPS();
+  if (delta < 0 || delta >= 2000000) delta = 0;
+  sec  = ntpEpochAtLastPPS.load(std::memory_order_acquire) + (uint32_t)(delta / 1000000);
   frac = (uint32_t)(((uint64_t)(delta % 1000000) * 4294967296ULL) / 1000000ULL);
 }
 
 /* ------------------------------------------------------------------ */
-/*  NTP-Antwort senden (RFC 4330)                                       */
+/*  NTP-Antwort senden (RFC 4330)                                      */
 /* ------------------------------------------------------------------ */
 void handleNTPRequest() {
-  // Empfangszeitpunkt so früh wie möglich stempeln (T2)
-  int64_t rxTimerUs = esp_timer_get_time();
+  // T2: von ISR gestempelt, bevor parsePacket() SPI-Overhead anfiel
+  int64_t t2 = readRxTimer();
 
   byte packetBuffer[48];
   ntpUDP.read(packetBuffer, 48);
 
   uint32_t refSec, refFrac, rxSec, rxFrac, txSec, txFrac;
 
-  // Reference Timestamp: Zeitpunkt des letzten GPS/PPS-Sync (Fraction = 0,
-  // da PPS per Definition die exakte Sekundengrenze markiert)
-  refSec  = ntpEpochAtLastPPS;
+  refSec  = ntpEpochAtLastPPS.load(std::memory_order_acquire);
   refFrac = 0;
 
-  // Receive Timestamp (T2): wann traf das Paket ein
-  usToNTP(rxTimerUs, rxSec, rxFrac);
-
-  // Transmit Timestamp (T3): unmittelbar vor dem Senden
+  usToNTP(t2, rxSec, rxFrac);
   usToNTP(esp_timer_get_time(), txSec, txFrac);
 
   byte reply[48];
@@ -178,7 +250,6 @@ void handleNTPRequest() {
   // Byte 2: Poll=0                        Byte 3: Precision=-15
   reply[0] = 0b00100100; reply[1] = 1; reply[2] = 0; reply[3] = (byte)-15;
 
-  // Reference Identifier (bytes 12–15): "GPS "
   memcpy(&reply[12], "GPS ", 4);
 
   // Reference Timestamp (bytes 16–23)
@@ -215,10 +286,10 @@ void sendMQTTStatus() {
     mqttClient.connect("ESP32-NTP-S3", mqtt_user, mqtt_pass);
   }
   if (mqttClient.connected()) {
-    String payload = "{\"sats\":"   + String(gps.satellites.value()) +
-                     ",\"hdop\":"   + String(gps.hdop.hdop())        +
-                     ",\"pps\":"    + String(ppsCount)               +
-                     ",\"served\":" + String(ntpRequestsServed)      + "}";
+    String payload = "{\"sats\":"   + String(gpsSats)           +
+                     ",\"hdop\":"   + String(gpsHdop)           +
+                     ",\"pps\":"    + String(ppsCount)          +
+                     ",\"served\":" + String(ntpRequestsServed) + "}";
     mqttClient.publish(mqtt_topic, payload.c_str());
   }
 }
