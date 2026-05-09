@@ -43,6 +43,7 @@
 #include <hardware/pio.h>
 #include <hardware/irq.h>
 #include <hardware/gpio.h>
+#include <hardware/dma.h>
 #include <pico/time.h>
 
 // PIO-Header (aus .pio-Dateien, von pioasm generiert)
@@ -111,6 +112,10 @@ volatile float   gpsHdop = 99.0f;
 static uint qspiOffsetCmd   = 0;
 static uint qspiOffsetWrite = 0;
 static uint qspiOffsetRead  = 0;
+
+/* DMA-Kanal + vorgepackter TX-Puffer (MSB-first 32-Bit-Wörter) */
+static int      qspiDmaCh  = -1;
+static uint32_t qspiDmaBuf[12];  // 48 Byte max = 12 Wörter
 
 /* ================================================================== */
 /*  W6300 SPI-Zugriff (Standard 4-wire SPI via Ethernet_Generic)      */
@@ -208,79 +213,84 @@ static void qspiReleaseGPIOs() {
 }
 
 static void qspiInit() {
-  // PIO-Programme in PIO1-Instruktionsspeicher laden
   qspiOffsetCmd   = pio_add_program(pio1, &spi_cmd_program);
   qspiOffsetWrite = pio_add_program(pio1, &qspi_write_program);
   qspiOffsetRead  = pio_add_program(pio1, &qspi_read_program);
-  // GPIO20/21 dauerhaft HIGH (WP#/HOLD# bei Single-SPI-Phase)
   gpio_init(ETH_IO2_PIN); gpio_set_dir(ETH_IO2_PIN, GPIO_OUT); gpio_put(ETH_IO2_PIN, 1);
   gpio_init(ETH_IO3_PIN); gpio_set_dir(ETH_IO3_PIN, GPIO_OUT); gpio_put(ETH_IO3_PIN, 1);
+  qspiDmaCh = dma_claim_unused_channel(true);
 }
 
 /*
- * qspiWriteBuf — schreibt len Bytes per Quad-SPI in den W6300-TX-Buffer.
+ * qspiWriteAsync — startet eine QSPI-Schreibtransaktion, kehrt nach DMA-Start zurück.
  *
- * Transaktion:
- *   CS↓ → opcode 0x32 (single SPI) → 3-Byte-Adresse (single SPI)
- *        → len Bytes Nutzdaten (quad SPI, 4-Bit/SCLK) → CS↑
+ *   Phase 1 (cmd+addr, SM0): blockierend, nur 4 Bytes — Overhead vernachlässigbar.
+ *   Phase 2 (daten, SM1):    DMA übergibt Bytes an PIO-FIFO; CPU frei während
+ *                             ~2 µs Taktzeit (40 Byte bei 37.5 MHz QSPI).
  *
- * Dauer bei 37.5 MHz QSPI, 48 Byte:
- *   Cmd+Addr: 32 Bits × 1 / 37.5 MHz ≈ 0.85 µs
- *   Daten:    48 × 8 Bits / 4 / 37.5 MHz ≈ 2.56 µs
- *   Gesamt: ~3.4 µs (vs. ~100 µs Standard-SPI)
+ * CS bleibt LOW; GPIOs gehören PIO1. Muss von qspiWriteWait() abgeschlossen werden.
  */
-static void qspiWriteBuf(uint16_t bufAddr, uint8_t bsb,
-                         const uint8_t* data, uint16_t len) {
+static void qspiWriteAsync(uint16_t bufAddr, uint8_t bsb,
+                           const uint8_t *data, uint16_t len) {
   uint8_t addrH = bufAddr >> 8;
   uint8_t addrL = bufAddr & 0xFF;
-  uint8_t ctrl  = (bsb << 3) | 0x04;  // write | VDM
+  uint8_t ctrl  = (bsb << 3) | 0x04;
+
+  // Daten als MSB-first 32-Bit-Wörter in DMA-Puffer packen
+  uint16_t nw = (len + 3) >> 2;
+  for (uint16_t i = 0; i < nw; i++) {
+    uint32_t w = 0;
+    for (int j = 0; j < 4 && (i * 4 + j) < len; j++)
+      w |= (uint32_t)data[i * 4 + j] << (24 - j * 8);
+    qspiDmaBuf[i] = w;
+  }
 
   qspiTakeGPIOs();
 
-  // --- Phase 1: Command + Address (Single-SPI, SM0) ---
+  // Phase 1: opcode + Adresse (Single-SPI, SM0, blockierend)
   spi_cmd_init(pio1, 0, qspiOffsetCmd, ETH_IO0_PIN, ETH_SCLK_PIN, QSPI_CLKDIV);
-
   gpio_put(ETH_CS_PIN, 0);
-
-  // Jedes Byte als MSB-ausgerichtetes 32-Bit-Wort (autopull threshold=8)
   pio_sm_put_blocking(pio1, 0, (uint32_t)W6300_OP_QUAD_WRITE << 24);
   pio_sm_put_blocking(pio1, 0, (uint32_t)addrH << 24);
   pio_sm_put_blocking(pio1, 0, (uint32_t)addrL << 24);
   pio_sm_put_blocking(pio1, 0, (uint32_t)ctrl  << 24);
-
-  // Warten bis TX-FIFO leer + letztes Byte vollständig getaktet
   while (!pio_sm_is_tx_fifo_empty(pio1, 0)) tight_loop_contents();
-  // 2 extra SM-Zyklen sichern, dass letzter SCLK-Puls abgeschlossen
   pio_sm_exec(pio1, 0, pio_encode_nop() | pio_encode_sideset(1, 0));
   pio_sm_exec(pio1, 0, pio_encode_nop() | pio_encode_sideset(1, 0));
   pio_sm_set_enabled(pio1, 0, false);
 
-  // --- Phase 2: Daten (Quad-SPI, SM1) ---
-  // IO0-IO3 als Ausgänge
+  // Phase 2: Daten (Quad-SPI, SM1, DMA — nicht-blockierend)
   pio_sm_set_consecutive_pindirs(pio1, 1, ETH_IO0_PIN, 4, true);
   qspi_write_init(pio1, 1, qspiOffsetWrite, ETH_IO0_PIN, ETH_SCLK_PIN, QSPI_CLKDIV);
 
-  // 4 Bytes pro 32-Bit-FIFO-Wort (autopull threshold=32, MSB-first)
-  uint16_t i = 0;
-  for (; i + 3 < len; i += 4) {
-    uint32_t w = ((uint32_t)data[i]   << 24) | ((uint32_t)data[i+1] << 16)
-               | ((uint32_t)data[i+2] <<  8) |  (uint32_t)data[i+3];
-    pio_sm_put_blocking(pio1, 1, w);
-  }
-  if (i < len) {  // Restliche Bytes (Padding mit 0)
-    uint32_t w = 0;
-    for (uint16_t j = i; j < len; j++) w |= (uint32_t)data[j] << (24 - (j - i) * 8);
-    pio_sm_put_blocking(pio1, 1, w);
-  }
+  dma_channel_config dc = dma_channel_get_default_config(qspiDmaCh);
+  channel_config_set_transfer_data_size(&dc, DMA_SIZE_32);
+  channel_config_set_read_increment(&dc, true);
+  channel_config_set_write_increment(&dc, false);
+  channel_config_set_dreq(&dc, pio_get_dreq(pio1, 1, true));
+  dma_channel_configure(qspiDmaCh, &dc, &pio1->txf[1], qspiDmaBuf, nw, true);
+  // DMA läuft; CPU kehrt zurück
+}
 
+/*
+ * qspiWriteWait — wartet auf DMA-Abschluss, leert PIO-FIFO, hebt CS und gibt GPIOs frei.
+ * Muss nach qspiWriteAsync() aufgerufen werden.
+ */
+static void qspiWriteWait() {
+  dma_channel_wait_for_finish_blocking(qspiDmaCh);
   while (!pio_sm_is_tx_fifo_empty(pio1, 1)) tight_loop_contents();
   pio_sm_exec(pio1, 1, pio_encode_nop() | pio_encode_sideset(1, 0));
   pio_sm_exec(pio1, 1, pio_encode_nop() | pio_encode_sideset(1, 0));
   pio_sm_set_enabled(pio1, 1, false);
-
-  gpio_put(ETH_CS_PIN, 1);  // CS↑
-
+  gpio_put(ETH_CS_PIN, 1);
   qspiReleaseGPIOs();
+}
+
+/* qspiWriteBuf — synchrone Variante (async + wait); für kurze Tail-Writes. */
+static void qspiWriteBuf(uint16_t bufAddr, uint8_t bsb,
+                         const uint8_t *data, uint16_t len) {
+  qspiWriteAsync(bufAddr, bsb, data, len);
+  qspiWriteWait();
 }
 
 /* ================================================================== */
@@ -411,71 +421,62 @@ static inline void usToNTP(uint64_t timerUs, uint32_t &sec, uint32_t &frac) {
 /* ================================================================== */
 /*  handleNTPRequest — RFC 4330, Stratum 1                            */
 /*                                                                      */
-/*  TX-Pfad mit QSPI:                                                   */
-/*    ntpUDP.beginPacket()  → setzt Ziel-IP/Port (SPI)                  */
-/*    w6300ReadReg16(TX_WR) → TX-Schreibzeiger lesen (SPI)              */
-/*    qspiWriteBuf()        → 48 Byte → W6300-TX-Buffer (QSPI, ~3 µs)  */
-/*    T3 = time_us_64()     → gestempelt direkt nach QSPI-Write         */
-/*    TX_WR += 48           → Schreibzeiger aktualisieren (SPI)         */
-/*    Sn_CR = SEND          → Ethernet-TX auslösen (SPI)                */
+/*  TX-Pfad mit DMA-QSPI:                                               */
+/*    ntpUDP.beginPacket()    → Ziel-IP/Port (SPI)                      */
+/*    w6300ReadReg16(TX_WR)   → TX-Schreibzeiger (SPI)                  */
+/*    qspiWriteAsync(0–39 B)  → DMA startet; CPU frei (~2 µs)           */
+/*    qspiWriteWait()         → DMA abwarten, CS↑                       */
+/*    T3 = time_us_64()       → deterministisch zwischen den Writes      */
+/*    qspiWriteBuf(40–47 B)   → T3-Bytes (8 Byte, synchron)             */
+/*    TX_WR += 48; Sn_CR=SEND → Ethernet-TX auslösen                    */
 /* ================================================================== */
 
 void handleNTPRequest() {
-  uint64_t t2 = rxTimerUs;  // PIO-ISR-Timestamp bei W6300-INTn-Flanke
+  uint64_t t2 = rxTimerUs;
 
   byte packetBuffer[48];
   ntpUDP.read(packetBuffer, 48);
 
-  uint32_t refSec  = ntpEpochAtLastPPS.load(std::memory_order_acquire);
-  uint32_t refFrac = 0;
+  uint32_t refSec = ntpEpochAtLastPPS.load(std::memory_order_acquire);
   uint32_t rxSec, rxFrac;
   usToNTP(t2, rxSec, rxFrac);
 
-  // Reply aufbauen (T3 kommt später, Bytes 40–47 werden unten überschrieben)
   byte reply[48];
   memset(reply, 0, 48);
   reply[0] = 0b00100100; reply[1] = 1; reply[2] = 0; reply[3] = (byte)-15;
   memcpy(&reply[12], "GPS ", 4);
 
-  // Reference Timestamp (bytes 16–23)
   reply[16]=(refSec >>24)&0xFF; reply[17]=(refSec >>16)&0xFF;
   reply[18]=(refSec >> 8)&0xFF; reply[19]= refSec      &0xFF;
-  // refFrac = 0 (bytes 20-23 already 0)
 
-  // Origin Timestamp (bytes 24–31): T1 des Clients
   memcpy(&reply[24], &packetBuffer[40], 8);
 
-  // Receive Timestamp (bytes 32–39): T2
   reply[32]=(rxSec >>24)&0xFF; reply[33]=(rxSec >>16)&0xFF;
   reply[34]=(rxSec >> 8)&0xFF; reply[35]= rxSec      &0xFF;
   reply[36]=(rxFrac>>24)&0xFF; reply[37]=(rxFrac>>16)&0xFF;
   reply[38]=(rxFrac>> 8)&0xFF; reply[39]= rxFrac      &0xFF;
 
-  // Ziel-IP/Port setzen (SPI via Ethernet_Generic)
   ntpUDP.beginPacket(ntpUDP.remoteIP(), ntpUDP.remotePort());
-
-  // TX-Schreibzeiger lesen (Sn_TX_WR, 16-bit, BSB=1 = Socket-0-Register)
   uint16_t txWrPtr = w6300ReadReg16(Sn_TX_WR, 1);
 
-  // QSPI: 48 Byte in TX-Buffer schreiben (BSB=2 = Socket-0-TX-Buffer)
-  // Nur Bytes 0–39 (T3 fehlt noch) → T3 hinterher einsetzen
-  qspiWriteBuf(txWrPtr & 0x1FFF, 2, reply, 40);
+  // Bytes 0–39 via DMA — CPU blockiert nicht während ~2 µs Taktzeit
+  qspiWriteAsync(txWrPtr & 0x1FFF, 2, reply, 40);
+  qspiWriteWait();
 
-  // T3: direkt nach QSPI-Write der ersten 40 Bytes
-  // Fehler = QSPI-Zeit für letzte 8 Bytes (~0.3 µs) + Sn_CR-SEND-Overhead (~1 µs)
+  // T3 zwischen den beiden QSPI-Writes: deterministischer Abstand ~2 µs vor SEND
   uint32_t txSec, txFrac;
   usToNTP(time_us_64(), txSec, txFrac);
 
-  // T3 in reply einsetzen und letzte 8 Bytes via QSPI nachschreiben
   reply[40]=(txSec >>24)&0xFF; reply[41]=(txSec >>16)&0xFF;
   reply[42]=(txSec >> 8)&0xFF; reply[43]= txSec      &0xFF;
   reply[44]=(txFrac>>24)&0xFF; reply[45]=(txFrac>>16)&0xFF;
   reply[46]=(txFrac>> 8)&0xFF; reply[47]= txFrac      &0xFF;
+
+  // Bytes 40–47 (T3) synchron — 8 Byte, DMA-Overhead würde nicht lohnen
   qspiWriteBuf((txWrPtr + 40) & 0x1FFF, 2, &reply[40], 8);
 
-  // TX-Schreibzeiger aktualisieren und SEND auslösen
   w6300WriteReg16(Sn_TX_WR, 1, txWrPtr + 48);
-  w6300Write(Sn_CR, 1, 0x20);  // Sn_CR = SEND
+  w6300Write(Sn_CR, 1, 0x20);
 }
 
 /* ================================================================== */
