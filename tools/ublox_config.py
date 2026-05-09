@@ -130,6 +130,19 @@ def _poll(ser: serial.Serial, cls: int, id_: int,
 # Port-Erkennung
 # ---------------------------------------------------------------------------
 
+def _probe_port(port: str, baud: int) -> bool:
+    """Gibt True zurück wenn auf diesem Port/Baud ein u-blox antwortet."""
+    try:
+        with serial.Serial(port, baud, timeout=0.5) as ser:
+            ser.reset_input_buffer()
+            for _ in range(2):
+                _send(ser, 0x0A, 0x04)
+            msg = _read_ubx(ser, timeout=2.0)
+            return msg is not None and msg[0] == 0x0A and msg[1] == 0x04
+    except (serial.SerialException, OSError):
+        return False
+
+
 def find_ublox() -> tuple:
     ports = [p.device for p in serial.tools.list_ports.comports()]
     if not ports:
@@ -137,17 +150,19 @@ def find_ublox() -> tuple:
     print(f"Verfügbare Ports: {', '.join(ports)}")
     for port in ports:
         for baud in PROBE_BAUDS:
-            try:
-                with serial.Serial(port, baud, timeout=0.5) as ser:
-                    ser.reset_input_buffer()
-                    _send(ser, 0x0A, 0x04)
-                    msg = _read_ubx(ser, timeout=1.2)
-                    if msg and msg[0] == 0x0A and msg[1] == 0x04:
-                        print(f"u-blox gefunden auf {port} @ {baud} Baud")
-                        return port, baud
-            except (serial.SerialException, OSError):
-                pass
+            if _probe_port(port, baud):
+                print(f"u-blox gefunden auf {port} @ {baud} Baud")
+                return port, baud
     return None, None
+
+
+def find_baud_on_port(port: str) -> int:
+    """Findet die aktuelle Baudrate eines bekannten Ports. Gibt 0 zurück wenn nicht gefunden."""
+    for baud in PROBE_BAUDS:
+        if _probe_port(port, baud):
+            print(f"u-blox antwortet auf {port} @ {baud} Baud")
+            return baud
+    return 0
 
 # ---------------------------------------------------------------------------
 # Chip-Identifikation
@@ -412,9 +427,17 @@ def main():
 
     # --- Port ermitteln ---
     if args.port:
-        port         = args.port
-        current_baud = args.baud if args.baud else 9600
-        print(f"Port: {port} @ {current_baud} Baud")
+        port = args.port
+        if args.baud:
+            current_baud = args.baud
+            print(f"Port: {port} @ {current_baud} Baud")
+        else:
+            print(f"Suche Baudrate auf {port}...")
+            current_baud = find_baud_on_port(port)
+            if current_baud == 0:
+                print(f"FEHLER: Kein u-blox Modul auf {port} gefunden "
+                      f"(getestet: {PROBE_BAUDS}).")
+                sys.exit(1)
     else:
         print("Suche u-blox GPS Modul...")
         port, current_baud = find_ublox()
