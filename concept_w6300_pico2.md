@@ -155,11 +155,29 @@ Limitierender Faktor wird das Netzwerk und der NTP-Client — nicht mehr die Har
 
 ## Offene Punkte vor Hardware-Test
 
-1. **QSPI-Takt verifizieren**: `QSPI_CLKDIV = 2.0f` → 37.5 MHz. W6300-Datenblatt gibt max. 50 MHz an — auf Signalqualität prüfen.
-2. **GPIO-Switching-Timing**: Kurze SPI-Transaktionen (Ethernet_Generic) müssen mit `qspiReleaseGPIOs()` korrekt abschließen.
-3. **T3 Split-Strategie validieren**: Die Split-Schreibstrategie (Bytes 0–39, dann T3-Stamp, dann Bytes 40–47) muss auf dem echten Board verifiziert werden.
-4. **GPS-UART-Pins**: GPIO4 (TX) / GPIO5 (RX) auf W6300-EVB-Pico2 verfügbar — in `W6300NTP.ino` als `GPS_RX_PIN 5` konfiguriert.
-5. **`Sn_TX_WR`-Handling**: Schreibzeiger muss nach jedem Paket korrekt inkrementiert werden; Ring-Buffer-Wrap prüfen.
+### Kritisch (Blocker)
+
+1. **`Sn_TX_WR` Registeradresse prüfen**: Im Code als `0x0022` definiert — laut W5500/W6300-Registermap ist `0x0022` jedoch `Sn_TX_RD` (Read Pointer), `Sn_TX_WR` (Write Pointer) ist `0x0024`. Falls falsch: keine NTP-Antworten. Sofort mit `Serial.println(w6300ReadReg16(0x0022, 1))` vs. `(0x0024, 1)` vergleichen und korrigieren.
+
+2. **`g_txWrPtr` Initialwert**: Nach `ntpUDP.begin(123)` muss `g_txWrPtr == 0x0000` sein. Mit `Serial.println(g_txWrPtr)` in `setup()` bestätigen, bevor der erste NTP-Request kommt.
+
+3. **QSPI-Takt Signalqualität**: `QSPI_CLKDIV = 2.0f` → 37.5 MHz. Mit Oszilloskop auf IO0–IO3 messen — Leitungskapazität auf EVB-Pico2 kann Flanken verzerren. Bei Fehlern `QSPI_CLKDIV` auf `3.0f` (25 MHz) erhöhen.
+
+### Validierung
+
+4. **T3 Split-Strategie messen**: Mit `chronyc tracking` die RMS-Abweichung loggen. Zielwert: < 10 µs systematischer Fehler (T3-Stamp zwischen den beiden QSPI-Writes).
+
+5. **GPIO-Switching-Timing**: Nach jeder SPI-Transaktion (Ethernet_Generic) muss `qspiReleaseGPIOs()` korrekt abschliessen — prüfen ob CS-Leitungen nach QSPI-Transaktion sauber HIGH sind.
+
+6. **GPS-UART-Pins**: `GPS_RX_PIN 1` / `GPS_TX_PIN 0` auf W6300-EVB-Pico2 verfügbar und nicht mit UART0 des USB-CDC kollidierend prüfen.
+
+### Fine-Tuning nach erstem erfolgreichen Betrieb
+
+7. **ISR-Flag statt Polling**: `ntpUDP.parsePacket()` in `loop()` pollt via SPI. Die `ethIntISR` setzt ein Flag; `loop()` prüft nur noch das Flag — eliminiert Loop-Latenz aus dem T2→handleNTPRequest-Pfad (potentiell ±50–200 µs weniger Jitter).
+
+8. **`mktime()` auf Core 1 absichern**: `mktime()` ist nicht deterministisch (Schaltjahr-Logik). Falls die NTP-Epoch gelegentlich um 1 Sekunde springt, `timegm()` (kein Timezone-Overhead) oder manuelle Berechnung verwenden.
+
+9. **Ring-Buffer-Wrap von `g_txWrPtr`**: Aktuell uint16_t, wraps at 0xFFFF. Der Masking-Ausdruck `txWrPtr & 0x1FFF` setzt 8 KB TX-Buffer voraus — bei anderem Puffer-Setup anpassen.
 
 ---
 
@@ -173,4 +191,4 @@ Limitierender Faktor wird das Netzwerk und der NTP-Client — nicht mehr die Har
 | Kosten/Verfügbarkeit | gut | gut |
 | Kompilierung | ✓ getestet | ✓ **kompiliert** (Hardware-Test ausstehend) |
 
-**Empfehlung:** Sinnvoll wenn ±50–100 µs das Ziel ist. QSPI-Treiber ist via PIO1 implementiert und kompiliert fehlerfrei. Nächster Schritt: Hardware-Test auf echtem W6300-EVB-Pico2.
+**Empfehlung:** Sinnvoll wenn ±50–100 µs das Ziel ist. QSPI-Treiber ist via PIO1 implementiert, SPI-Overhead im TX-Pfad eliminiert (`beginPacket()` → direkte Register-Writes, `Sn_TX_WR` software-tracked). Nächster Schritt: Hardware-Test auf echtem W6300-EVB-Pico2, Blocker 1–3 zuerst prüfen.

@@ -13,8 +13,8 @@
  *   std::atomic      Cross-Core-Epoch mit release/acquire-Ordering
  *
  * QSPI-TX-Pfad (handleNTPRequest):
- *   1. ntpUDP.beginPacket() setzt Ziel-IP/Port via SPI (Ethernet_Generic)
- *   2. w6300ReadReg16(Sn_TX_WR) liest TX-Schreibzeiger via SPI
+ *   1. w6300WriteN(Sn_DIPR) + w6300WriteReg16(Sn_DPORT): Ziel direkt (kein beginPacket())
+ *   2. g_txWrPtr aus RAM — TX-Schreibzeiger software-tracked (kein SPI-Roundtrip)
  *   3. qspiWriteBuf() schreibt 48-Byte-NTP-Reply via PIO1-QSPI in TX-Buffer
  *   4. T3 = time_us_64() — direkt nach QSPI-Write, ~1 µs vor SEND
  *   5. w6300WriteReg16(Sn_TX_WR) aktualisiert Schreibzeiger via SPI
@@ -68,6 +68,8 @@
 
 /* W6300 Socket-0 Register-Adressen (BSB=1) */
 #define Sn_CR       0x0001  // Command Register
+#define Sn_DIPR     0x000C  // Destination IP (4 Bytes)
+#define Sn_DPORT    0x0010  // Destination Port (16-bit)
 #define Sn_TX_WR    0x0022  // TX Write Pointer (16-bit)
 
 /* W6300 QSPI-Opcodes (Flash-kompatibel) */
@@ -107,6 +109,9 @@ uint32_t ntpRequestsServed = 0;
 /* GPS-Statuscache — Core 1 schreibt, Core 0 liest (MQTT) */
 volatile uint8_t gpsSats = 0;
 volatile float   gpsHdop = 99.0f;
+
+/* TX-Write-Pointer: einmalig in setup() gelesen, danach software-tracked */
+static uint16_t g_txWrPtr = 0;
 
 /* PIO1 SM-Offsets (QSPI), nach qspiInit() gültig */
 static uint qspiOffsetCmd   = 0;
@@ -165,6 +170,17 @@ static void w6300WriteReg16(uint16_t addr, uint8_t bsb, uint16_t val) {
   SPI.transfer((bsb << 3) | 0x04);
   SPI.transfer(val >> 8);
   SPI.transfer(val & 0xFF);
+  digitalWrite(ETH_CS_PIN, HIGH);
+  SPI.endTransaction();
+}
+
+static void w6300WriteN(uint16_t addr, uint8_t bsb, const uint8_t *data, uint8_t len) {
+  SPI.beginTransaction(SPISettings(50000000, MSBFIRST, SPI_MODE0));
+  digitalWrite(ETH_CS_PIN, LOW);
+  SPI.transfer(addr >> 8);
+  SPI.transfer(addr & 0xFF);
+  SPI.transfer((bsb << 3) | 0x04);
+  for (uint8_t i = 0; i < len; i++) SPI.transfer(data[i]);
   digitalWrite(ETH_CS_PIN, HIGH);
   SPI.endTransaction();
 }
@@ -344,6 +360,7 @@ void setup() {
   Ethernet.init(ETH_CS_PIN);
   Ethernet.begin(mac, ip, dnsServer, gateway, subnet);
   ntpUDP.begin(123);
+  g_txWrPtr = w6300ReadReg16(Sn_TX_WR, 1);  // einmalig lesen; danach software-tracked
 
   // W6300 Socket-0 RECV-Interrupt aktivieren (nach ntpUDP.begin())
   w6300Write(0x002C, 1, 0x04);  // Sn_IMR: RECV-Bit
@@ -422,13 +439,14 @@ static inline void usToNTP(uint64_t timerUs, uint32_t &sec, uint32_t &frac) {
 /*  handleNTPRequest — RFC 4330, Stratum 1                            */
 /*                                                                      */
 /*  TX-Pfad mit DMA-QSPI:                                               */
-/*    ntpUDP.beginPacket()    → Ziel-IP/Port (SPI)                      */
-/*    w6300ReadReg16(TX_WR)   → TX-Schreibzeiger (SPI)                  */
+/*    w6300WriteN(Sn_DIPR)    → Ziel-IP direkt (4-Byte SPI-Burst)       */
+/*    w6300WriteReg16(DPORT)  → Ziel-Port direkt (kein beginPacket())   */
+/*    g_txWrPtr aus RAM       → TX-Schreibzeiger (kein SPI-Roundtrip)   */
 /*    qspiWriteAsync(0–39 B)  → DMA startet; CPU frei (~2 µs)           */
 /*    qspiWriteWait()         → DMA abwarten, CS↑                       */
 /*    T3 = time_us_64()       → deterministisch zwischen den Writes      */
 /*    qspiWriteBuf(40–47 B)   → T3-Bytes (8 Byte, synchron)             */
-/*    TX_WR += 48; Sn_CR=SEND → Ethernet-TX auslösen                    */
+/*    g_txWrPtr += 48; SEND   → software-tracked, TX auslösen           */
 /* ================================================================== */
 
 void handleNTPRequest() {
@@ -456,8 +474,13 @@ void handleNTPRequest() {
   reply[36]=(rxFrac>>24)&0xFF; reply[37]=(rxFrac>>16)&0xFF;
   reply[38]=(rxFrac>> 8)&0xFF; reply[39]= rxFrac      &0xFF;
 
-  ntpUDP.beginPacket(ntpUDP.remoteIP(), ntpUDP.remotePort());
-  uint16_t txWrPtr = w6300ReadReg16(Sn_TX_WR, 1);
+  // Ziel direkt in Register schreiben — beginPacket() spart ~3 SPI-Transaktionen
+  const IPAddress rem = ntpUDP.remoteIP();
+  const uint8_t ipBytes[4] = { rem[0], rem[1], rem[2], rem[3] };
+  w6300WriteN(Sn_DIPR, 1, ipBytes, 4);
+  w6300WriteReg16(Sn_DPORT, 1, ntpUDP.remotePort());
+
+  uint16_t txWrPtr = g_txWrPtr;  // aus RAM, kein SPI-Roundtrip
 
   // Bytes 0–39 via DMA — CPU blockiert nicht während ~2 µs Taktzeit
   qspiWriteAsync(txWrPtr & 0x1FFF, 2, reply, 40);
@@ -475,7 +498,8 @@ void handleNTPRequest() {
   // Bytes 40–47 (T3) synchron — 8 Byte, DMA-Overhead würde nicht lohnen
   qspiWriteBuf((txWrPtr + 40) & 0x1FFF, 2, &reply[40], 8);
 
-  w6300WriteReg16(Sn_TX_WR, 1, txWrPtr + 48);
+  g_txWrPtr += 48;
+  w6300WriteReg16(Sn_TX_WR, 1, g_txWrPtr);
   w6300Write(Sn_CR, 1, 0x20);
 }
 
