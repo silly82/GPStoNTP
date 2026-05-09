@@ -38,7 +38,7 @@
 #define ETH_INT_PIN   10  // W5500 INT → GPIO10 (auf Waveshare ESP32-S3-ETH fest verdrahtet)
 #define GPS_RX_PIN    1
 #define GPS_TX_PIN    2
-#define PPS_PIN       4
+#define PPS_PIN       3
 
 /* --- NETZWERK-KONFIGURATION (aus config.h) --- */
 byte mac[]       = CFG_MAC;

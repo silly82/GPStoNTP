@@ -55,6 +55,6 @@ Key invariants:
 | W5500 SCLK/MISO/MOSI/CS/RST | 13/12/11/14/9 |
 | W5500 INT | 10 (`ETH_INT_PIN`, auf Waveshare ESP32-S3-ETH fest verdrahtet) |
 | GPS RX/TX | 1/2 |
-| PPS | 4 |
+| PPS | 3 |
 
 **Config** (`config.h`, never committed): network (`CFG_MAC`, `CFG_IP`, `CFG_GATEWAY`, `CFG_SUBNET`, `CFG_DNS`) and MQTT (`CFG_MQTT_SERVER/USER/PASS/TOPIC`).
