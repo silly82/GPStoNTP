@@ -34,7 +34,7 @@ Das Waveshare ESP32-S3-ETH hat den W5500 bereits onboard verdrahtet — kein sep
 | ETH INT | 10 | onboard W5500, für ISR-Zeitstempel |
 | GPS RX (ESP empfängt) | 1 | |
 | GPS TX (ESP sendet) | 2 | |
-| PPS | 4 | |
+| PPS | 3 | |
 
 ## Netzwerkkonfiguration
 
@@ -116,8 +116,8 @@ W5500 INT (FALLING) ──► ISR: rxTimerUs = esp_timer_get_time()  ← T2
 
 | Branch | Status | Beschreibung |
 |---|---|---|
-| `main` | stabil | Bewährter Stand, polling-basiertes T2 |
-| `fast` | in Erprobung | W5500-INT-ISR, GPS auf Core 0, SPI 20 MHz |
+| `main` | stabil | W5500-INT-ISR, GPS auf Core 0, SPI 20 MHz — hardware-getestet |
+| `concept/w6300-pico2` | Konzept | RP2350 + W6300 mit PIO-Zeitstempeln (experimentell) |
 
 ## Tools
 
@@ -164,11 +164,13 @@ Nach jedem Lauf wird `tools/gpsconfig.md` mit den tatsächlich angewendeten Eins
 ## Kompilieren & Flashen
 
 1. Arduino IDE ≥ 2.x öffnen, ESP32-Boardpaket installiert (Espressif).
-2. Board: **ESP32S3 Dev Module** (oder passendes ESP32-S3-Board).
+2. Board: **ESP32S3 Dev Module**, USB CDC On Boot: **Enabled** (für Serial-Monitor über USB).
 3. Obige Bibliotheken installieren.
 4. `tools/ublox_config.py` ausführen um das GPS-Modul zu konfigurieren.
 5. `config.h.example` → `config.h` kopieren und Werte eintragen.
 6. Kompilieren & Hochladen.
+
+> **Arduino CLI:** `arduino-cli compile --fqbn esp32:esp32:esp32s3:CDCOnBoot=cdc --port <PORT> --upload .`
 
 ## Konfiguration anpassen
 
